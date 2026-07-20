@@ -1,0 +1,24 @@
+{
+  "input": {
+    "job_id": "rep_sdt2v_ai_ads_video_demo_001",
+    "job_type": "rep_sdt2v_ai_ads_video_text_to_video",
+    "provider": "replicate_seedance_ai_product_ads_text_video",
+    "mode": "rep_sdt2v_ai_ads_video_t2v",
+    "pipeline_mode": "Rep_sdt2v_AI__Ads_video_cpu",
+    "replicate_model": "bytedance/seedance-2.0-mini",
+    "prompt": "Quay cận cảnh một chai nước hoa cao cấp trên bục đá đen, ánh sáng viền sang trọng, camera dolly chậm, nhấn mạnh thiết kế chai và cảm giác thương hiệu tinh tế.",
+    "aspect_ratio": "9:16",
+    "duration": "15",
+    "duration_sec": 15,
+    "target_duration_sec": 15,
+    "replicate_source_duration": "4",
+    "replicate_source_duration_sec": 4,
+    "minimum_beats": 7,
+    "narration_text": "Hương thơm tinh tế, lưu giữ dấu ấn riêng trong từng khoảnh khắc.",
+    "voice_selection": "Other_languages_shimmer",
+    "voice_provider": "openai_gpt_4o_mini_tts",
+    "resolution": "480p",
+    "generate_audio": true,
+    "callback_url": "https://api.zizenlabs.com/api/internal/rep-sdt2v-ai-ads-video-callback"
+  }
+}
