@@ -27,7 +27,7 @@ from openai import OpenAI
 
 # Locked model for this flow: Seedance 2.0 Mini Text-to-Video on Replicate.
 # Do not switch this endpoint to another model accidentally.
-REPLICATE_T2V_MODEL_ID_DEFAULT = "bytedance/seedance-2.0-fast"
+REPLICATE_T2V_MODEL_ID_DEFAULT = "bytedance/seedance-2.0-mini"
 REPLICATE_T2V_MODEL_ID = REPLICATE_T2V_MODEL_ID_DEFAULT
 OPENAI_PLANNER_MODEL_DEFAULT = "gpt-4o-mini"
 OPENAI_TTS_MODEL_DEFAULT = "gpt-4o-mini-tts"
