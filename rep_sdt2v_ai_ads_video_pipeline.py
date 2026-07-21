@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 Zizen Labs — Rep_sdt2v_AI__Ads_video_cpu.
 CPU orchestrator only:
-User text -> GPT-4o-mini planner -> Replicate Seedance 2.0 fast T2V at a duration-specific source length -> slow-motion extension -> optional TTS -> local mp4.
+User text -> GPT-4o-mini planner -> Replicate Seedance 2.0 Mini T2V at a duration-specific source length -> motion-interpolated high-quality extension -> optional TTS -> local mp4.
 
 Locked duration rules:
 - 8s output: 4s source, at least 5 beats.
@@ -172,7 +172,7 @@ Task:
 - Keep one coherent subject and one coherent scene, but structure the motion as a continuous sequence of AT LEAST {minimum_beats} distinct visual/action beats.
 - Each beat must be concrete and visible: body movement, object interaction, environmental reaction, camera movement, or a clear change in framing.
 - Keep the user's intent, subject, mood, style, setting, and requested actions.
-- Make the sequence physically plausible and temporally continuous so it remains stable when slowed to {target_duration} seconds.
+- Make the sequence physically plausible and temporally continuous so it remains stable during motion-interpolated extension to {target_duration} seconds.
 - Add cinematic camera language, lighting, temporal consistency, and artifact-prevention instructions.
 - If people/humans/faces are involved, integrate the human quality requirements compactly.
 - The final replicate_prompt must contain these three exact mandatory sentences, each exactly once:
@@ -188,7 +188,7 @@ User input, max 1500 chars:
 Selected settings:
 - aspect_ratio: {aspect_ratio}
 - replicate_generation_duration: {source_duration}s
-- user_target_duration_after_slow_motion: {target_duration}s
+- user_target_duration_after_postprocess: {target_duration}s
 - minimum_beats: {minimum_beats}
 - resolution: 480p
 - generate_audio: false
@@ -416,40 +416,135 @@ def probe_duration_sec(path: str) -> float:
         return float(REPLICATE_SOURCE_DURATION_SEC_DEFAULT)
 
 
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(_str(os.getenv(name), str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _bounded_env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(_str(os.getenv(name), str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = _str(os.getenv(name), "1" if default else "0").lower()
+    return raw not in {"0", "false", "no", "off", "disabled"}
+
+
 def extend_video_to_duration(input_path: str, output_path: str, target_duration_sec: int) -> Dict[str, Any]:
-    """Stretch the source clip to the selected final duration using slow motion only."""
+    """
+    Extend a short source clip while preserving clarity.
+
+    Primary path:
+    - slow the timestamps with setpts;
+    - synthesize intermediate frames with motion-compensated interpolation;
+    - apply restrained luma sharpening;
+    - encode with a low CRF instead of FFmpeg's much softer default quality.
+
+    If the installed FFmpeg build cannot run minterpolate, retry automatically
+    with a high-quality sharpened slow-motion fallback.
+    """
     input_path = str(input_path)
     output_path = str(output_path)
     target_duration_sec = int(target_duration_sec)
     source_duration = probe_duration_sec(input_path)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+    ratio = target_duration_sec / max(source_duration, 0.1)
+    output_fps = _bounded_env_int("POSTPROCESS_FPS", 24, 18, 60)
+    crf = _bounded_env_int("POSTPROCESS_CRF", 13, 0, 28)
+    sharpen_amount = _bounded_env_float("POSTPROCESS_SHARPEN_AMOUNT", 0.45, 0.0, 1.2)
+    use_motion_interpolation = _env_flag("POSTPROCESS_USE_MOTION_INTERPOLATION", True)
+    preset = _str(os.getenv("POSTPROCESS_X264_PRESET"), "slow").lower()
+    if preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
+        preset = "slow"
+
+    sharpen_filter = f"unsharp=5:5:{sharpen_amount:.2f}:3:3:0.0"
+    common_tail = f"{sharpen_filter},tpad=stop_mode=clone:stop_duration=2,fps={output_fps}"
+    interpolation_filter = (
+        f"format=yuv420p,setpts={ratio:.8f}*PTS,"
+        f"minterpolate=fps={output_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+        f"{common_tail}"
+    )
+    fallback_filter = (
+        f"format=yuv420p,setpts={ratio:.8f}*PTS,"
+        f"{common_tail}"
+    )
+
+    def encode_with_filter(filter_chain: str) -> None:
+        _run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-map", "0:v:0",
+            "-filter:v", filter_chain,
+            "-t", str(target_duration_sec),
+            "-an",
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-crf", str(crf),
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path,
+        ])
+
+    requested_strategy = "motion_interpolated_slowmo_sharpened" if use_motion_interpolation else "high_quality_slowmo_sharpened"
+    strategy = requested_strategy
+    interpolation_fallback_reason = ""
+
     log(
         f"POSTPROCESS START | source_path={input_path} | output_path={output_path} | "
-        f"source_duration={source_duration:.3f}s | target_duration={target_duration_sec}s | strategy=slowmo"
+        f"source_duration={source_duration:.3f}s | target_duration={target_duration_sec}s | "
+        f"ratio={ratio:.4f} | fps={output_fps} | crf={crf} | sharpen={sharpen_amount:.2f} | "
+        f"strategy={requested_strategy}"
     )
-    ratio = target_duration_sec / max(source_duration, 0.1)
-    _run([
-        "ffmpeg", "-y", "-i", input_path,
-        "-filter:v", f"setpts={ratio:.8f}*PTS,fps=24",
-        "-t", str(target_duration_sec),
-        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path,
-    ])
+
+    if use_motion_interpolation:
+        try:
+            encode_with_filter(interpolation_filter)
+        except RuntimeError as exc:
+            interpolation_fallback_reason = str(exc)[-900:]
+            strategy = "high_quality_slowmo_sharpened_fallback"
+            log(
+                "Motion interpolation failed; retrying with the high-quality sharpened fallback. "
+                f"Reason: {interpolation_fallback_reason}"
+            )
+            encode_with_filter(fallback_filter)
+    else:
+        encode_with_filter(fallback_filter)
+
     if not Path(output_path).exists() or Path(output_path).stat().st_size < 2048:
         raise RuntimeError(f"Postprocess failed: output file not created or too small: {output_path}")
+
     final_duration = probe_duration_sec(output_path)
     if final_duration < target_duration_sec - 0.45:
         raise RuntimeError(
             f"Postprocess duration validation failed: target={target_duration_sec}s, final={final_duration:.3f}s."
         )
-    log(f"POSTPROCESS DONE | strategy=slowmo | final_duration={final_duration:.3f}s")
+
+    log(
+        f"POSTPROCESS DONE | strategy={strategy} | final_duration={final_duration:.3f}s | "
+        f"fps={output_fps} | crf={crf}"
+    )
     return {
         "extended": True,
         "source_duration_sec": source_duration,
         "target_duration_sec": target_duration_sec,
         "final_duration_sec": final_duration,
-        "strategy": "slowmo",
+        "strategy": strategy,
         "slowmo_ratio": ratio,
+        "motion_interpolation_requested": use_motion_interpolation,
+        "motion_interpolation_applied": strategy == "motion_interpolated_slowmo_sharpened",
+        "interpolation_fallback_reason": interpolation_fallback_reason,
+        "output_fps": output_fps,
+        "x264_crf": crf,
+        "x264_preset": preset,
+        "sharpen_amount": sharpen_amount,
     }
 
 
