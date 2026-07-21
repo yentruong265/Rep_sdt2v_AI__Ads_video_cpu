@@ -7,10 +7,10 @@ User text -> GPT-4o-mini planner -> Replicate Seedance 2.0 Mini T2V at a duratio
 
 Locked duration rules:
 - 8s output: 4s source, at least 5 beats.
-- 15s output: 4s source, at least 7 beats.
-- 30s output: 5s source, at least 9 beats.
-- 60s output: 8s source, at least 14 beats.
-- Replicate is always 720p with generate_audio=false; optional narration audio is generated separately and muxed locally.
+- 20s output: 4s source, at least 7 beats.
+- 30s output: 4s source, at least 8 beats.
+- 60s output: 4s source, at least 8 beats.
+- Replicate uses Seedance 2.0 Mini with generate_audio=false: Eco=480p, Premium=720p; optional narration audio is generated separately and muxed locally.
 """
 
 import json
@@ -35,11 +35,12 @@ OPENAI_TTS_MODEL_DEFAULT = "gpt-4o-mini-tts"
 ALLOWED_ASPECT_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}
 TARGET_DURATION_RULES = {
     "8": {"source_duration": 4, "minimum_beats": 5, "narration_limit": 120},
-    "15": {"source_duration": 4, "minimum_beats": 6, "narration_limit": 225},
-    "30": {"source_duration": 5, "minimum_beats": 7, "narration_limit": 450},
-    "60": {"source_duration": 7, "minimum_beats": 9, "narration_limit": 900},
+    "20": {"source_duration": 4, "minimum_beats": 7, "narration_limit": 300},
+    "30": {"source_duration": 4, "minimum_beats": 8, "narration_limit": 450},
+    "60": {"source_duration": 4, "minimum_beats": 8, "narration_limit": 900},
 }
 ALLOWED_TARGET_DURATIONS = set(TARGET_DURATION_RULES)
+VIDEO_QUALITY_RESOLUTIONS = {"eco": "480p", "premium": "720p"}
 REPLICATE_SOURCE_DURATION_SEC_DEFAULT = 4
 REPLICATE_API_BASE = "https://api.replicate.com/v1"
 GPT_TTS_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar"}
@@ -76,6 +77,14 @@ def _str(v: Any, default: str = "") -> str:
 def normalize_aspect_ratio(value: Any) -> str:
     value = _str(value, "9:16")
     return value if value in ALLOWED_ASPECT_RATIOS else "9:16"
+
+
+def normalize_video_quality(job: Dict[str, Any]) -> str:
+    return "premium" if _str(job.get("resolution")).lower() == "720p" else "eco"
+
+
+def get_video_resolution(video_quality: str) -> str:
+    return VIDEO_QUALITY_RESOLUTIONS.get(video_quality, VIDEO_QUALITY_RESOLUTIONS["eco"])
 
 
 def normalize_target_duration(value: Any) -> str:
@@ -161,6 +170,7 @@ def build_planner_instruction(
     target_duration: str,
     source_duration: int,
     minimum_beats: int,
+    resolution: str,
 ) -> str:
     return f"""
 You are FlozenAI's professional short AI video prompt planner for Replicate Seedance Text-to-Video.
@@ -168,7 +178,7 @@ You are FlozenAI's professional short AI video prompt planner for Replicate Seed
 Task:
 - Read ONLY the user's text input below.
 - Rewrite it into one concise, high-quality English video generation prompt.
-- The model source clip will be exactly {source_duration} seconds at 720p with no audio.
+- The model source clip will be exactly {source_duration} seconds at {resolution} with no audio.
 - Keep one coherent subject and one coherent scene, but structure the motion as a continuous sequence of AT LEAST {minimum_beats} distinct visual/action beats.
 - Each beat must be concrete and visible: body movement, object interaction, environmental reaction, camera movement, or a clear change in framing.
 - Keep the user's intent, subject, mood, style, setting, and requested actions.
@@ -190,7 +200,7 @@ Selected settings:
 - replicate_generation_duration: {source_duration}s
 - user_target_duration_after_postprocess: {target_duration}s
 - minimum_beats: {minimum_beats}
-- resolution: 720p
+- resolution: {resolution}
 - generate_audio: false
 
 Human quality requirements to integrate compactly when relevant:
@@ -222,6 +232,7 @@ def plan_replicate_prompt(
     target_duration: str,
     source_duration: int,
     minimum_beats: int,
+    resolution: str,
 ) -> Dict[str, Any]:
     if not os.getenv("OPENAI_API_KEY"):
         log("OPENAI_API_KEY missing; using fallback prompt.")
@@ -233,7 +244,9 @@ def plan_replicate_prompt(
 
     model = os.getenv("OPENAI_PLANNER_MODEL", OPENAI_PLANNER_MODEL_DEFAULT)
     client = OpenAI()
-    instruction = build_planner_instruction(user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats)
+    instruction = build_planner_instruction(
+        user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats, resolution
+    )
     log(f"Calling OpenAI planner: {model} | source={source_duration}s | minimum_beats={minimum_beats}")
     resp = client.chat.completions.create(
         model=model,
@@ -295,12 +308,19 @@ def first_video_url(result: Any) -> str:
     return ""
 
 
-def build_replicate_input(prompt: str, aspect_ratio: str, source_duration: int) -> Dict[str, Any]:
-    """Build a cost-locked Seedance input for the selected output-duration rule."""
+def build_replicate_input(
+    prompt: str,
+    aspect_ratio: str,
+    source_duration: int,
+    resolution: str,
+) -> Dict[str, Any]:
+    """Build a cost-locked Seedance input for the selected duration and quality rules."""
+    if resolution not in VIDEO_QUALITY_RESOLUTIONS.values():
+        raise ValueError(f"Unsupported Seedance resolution: {resolution}")
     input_payload = {
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
-        "resolution": "720p",
+        "resolution": resolution,
         "duration": int(source_duration),
         "generate_audio": False,
     }
@@ -315,7 +335,7 @@ def build_replicate_input(prompt: str, aspect_ratio: str, source_duration: int) 
 
     # These three fields are hard-locked after optional extras so cost/audio rules cannot be overridden.
     input_payload["duration"] = int(source_duration)
-    input_payload["resolution"] = "720p"
+    input_payload["resolution"] = resolution
     input_payload["generate_audio"] = False
     log(
         f"REPLICATE FINAL INPUT | duration={input_payload.get('duration')} | "
@@ -325,7 +345,12 @@ def build_replicate_input(prompt: str, aspect_ratio: str, source_duration: int) 
     return input_payload
 
 
-def call_replicate_t2v(prompt: str, aspect_ratio: str, source_duration: int) -> Dict[str, Any]:
+def call_replicate_t2v(
+    prompt: str,
+    aspect_ratio: str,
+    source_duration: int,
+    resolution: str,
+) -> Dict[str, Any]:
     token = os.getenv("REPLICATE_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("Missing REPLICATE_API_TOKEN environment variable.")
@@ -335,10 +360,13 @@ def call_replicate_t2v(prompt: str, aspect_ratio: str, source_duration: int) -> 
         raise RuntimeError("Replicate model id must look like owner/model, for example bytedance/seedance-1.5-pro")
     owner, model_name = model_id.split("/", 1)
     url = f"{REPLICATE_API_BASE}/models/{owner}/{model_name}/predictions"
-    arguments = build_replicate_input(prompt, aspect_ratio, source_duration)
+    arguments = build_replicate_input(prompt, aspect_ratio, source_duration, resolution)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Prefer": "wait=60"}
 
-    log(f"Calling Replicate {model_id} | source_duration={source_duration}s | resolution=720p | aspect_ratio={aspect_ratio}")
+    log(
+        f"Calling Replicate {model_id} | source_duration={source_duration}s | "
+        f"resolution={resolution} | aspect_ratio={aspect_ratio}"
+    )
     start = time.time()
     res = requests.post(url, headers=headers, json={"input": arguments}, timeout=90)
     text = res.text
@@ -748,6 +776,8 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Missing prompt. Please enter a text request up to 1500 characters.")
 
     aspect_ratio = normalize_aspect_ratio(job.get("aspect_ratio"))
+    video_quality = normalize_video_quality(job)
+    resolution = get_video_resolution(video_quality)
     target_duration = normalize_target_duration(job.get("target_duration_sec") or job.get("duration") or job.get("duration_sec"))
     target_duration_sec = int(target_duration)
     duration_rule = get_duration_rule(target_duration)
@@ -759,13 +789,21 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
 
     log(
         f"REQUEST SETTINGS | target={target_duration_sec}s | source={source_duration}s | "
-        f"minimum_beats={minimum_beats} | aspect_ratio={aspect_ratio} | generate_audio={generate_audio}"
+        f"minimum_beats={minimum_beats} | aspect_ratio={aspect_ratio} | "
+        f"video_quality={video_quality} | resolution={resolution} | generate_audio={generate_audio}"
     )
-    plan = plan_replicate_prompt(job, user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats)
+    plan = plan_replicate_prompt(
+        job, user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats, resolution
+    )
     prompt = _str(plan.get("replicate_prompt") or plan.get("seedance_prompt")) or fallback_prompt(user_prompt, source_duration, minimum_beats)
     prompt = ensure_mandatory_prompt_sentences(prompt)
 
-    rep_result = call_replicate_t2v(prompt=prompt, aspect_ratio=aspect_ratio, source_duration=source_duration)
+    rep_result = call_replicate_t2v(
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+        source_duration=source_duration,
+        resolution=resolution,
+    )
     raw_path = f"/tmp/{job_id}_replicate_seedance_{source_duration}s_source.mp4"
     silent_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_silent.mp4"
     final_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_final.mp4"
@@ -807,7 +845,8 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         "audio_duration_sec": audio_duration,
         "replicate_elapsed_sec": rep_result.get("replicate_elapsed_sec", 0),
         "aspect_ratio": aspect_ratio,
-        "resolution": "720p",
+        "video_quality": video_quality,
+        "resolution": resolution,
         "duration": target_duration,
         "duration_sec": target_duration_sec,
         "final_duration_sec": final_duration,
