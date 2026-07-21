@@ -55,9 +55,11 @@ MANDATORY_NATURAL_ACTION_SENTENCE = (
     "All actions and movements in the video must look natural, physically plausible, temporally coherent, "
     "and free from AI errors such as warping, flicker, glitches, distorted anatomy, or unnatural motion."
 )
+
 MANDATORY_4K_QUALITY_SENTENCE = (
     "The video must have razor-sharp 4K image quality with crisp fine details, clean focus, realistic textures, "
-    "stable clarity, and professional cinematic rendering."
+    "stable clarity, and professional cinematic rendering. The entire video must look exceptionally lifelike, "
+    "vivid, natural, and convincingly real, with realistic motion, lighting, depth, materials, and physical behavior."
 )
 MANDATORY_PRODUCT_AD_SENTENCE = "Create a professional product advertising video."
 PLANNER_PROMPT_MAX_CHARS = 1500
