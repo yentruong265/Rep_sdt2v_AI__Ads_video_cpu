@@ -439,16 +439,23 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 def extend_video_to_duration(input_path: str, output_path: str, target_duration_sec: int) -> Dict[str, Any]:
     """
-    Extend a short source clip while preserving clarity.
+    Extend a short source clip without asking optical flow to invent a very
+    large number of frames after the clip has already been slowed down.
 
-    Primary path:
-    - slow the timestamps with setpts;
-    - synthesize intermediate frames with motion-compensated interpolation;
-    - apply restrained luma sharpening;
-    - encode with a low CRF instead of FFmpeg's much softer default quality.
+    Anti-warp strategy:
+    1. Interpolate the ORIGINAL adjacent frames to a bounded internal FPS.
+    2. Slow the already-denser timeline with setpts.
+    3. Convert to the requested output FPS using frame selection/duplication.
+    4. Encode at low CRF, with sharpening disabled or kept extremely mild.
 
-    If the installed FFmpeg build cannot run minterpolate, retry automatically
-    with a high-quality sharpened slow-motion fallback.
+    This order is intentionally different from the previous implementation.
+    Running setpts first and minterpolate afterward forces motion estimation
+    across an artificially enlarged temporal gap, which can create liquid,
+    wavy edges around products, food, hands, faces, steam, and reflections.
+
+    If minterpolate is unavailable or fails, the function falls back to a
+    distortion-free frame-duplication slow-motion path. The fallback can look
+    less fluid, but it will not create optical-flow warping.
     """
     input_path = str(input_path)
     output_path = str(output_path)
@@ -458,22 +465,45 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
 
     ratio = target_duration_sec / max(source_duration, 0.1)
     output_fps = _bounded_env_int("POSTPROCESS_FPS", 24, 18, 60)
-    crf = _bounded_env_int("POSTPROCESS_CRF", 13, 0, 28)
-    sharpen_amount = _bounded_env_float("POSTPROCESS_SHARPEN_AMOUNT", 0.45, 0.0, 1.2)
+    max_interpolation_fps = _bounded_env_int("POSTPROCESS_MAX_INTERPOLATION_FPS", 72, output_fps, 120)
+    crf = _bounded_env_int("POSTPROCESS_CRF", 12, 0, 28)
+    sharpen_amount = _bounded_env_float("POSTPROCESS_SHARPEN_AMOUNT", 0.10, 0.0, 0.35)
     use_motion_interpolation = _env_flag("POSTPROCESS_USE_MOTION_INTERPOLATION", True)
     preset = _str(os.getenv("POSTPROCESS_X264_PRESET"), "slow").lower()
     if preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
         preset = "slow"
 
-    sharpen_filter = f"unsharp=5:5:{sharpen_amount:.2f}:3:3:0.0"
-    common_tail = f"{sharpen_filter},tpad=stop_mode=clone:stop_duration=2,fps={output_fps}"
-    interpolation_filter = (
-        f"format=yuv420p,setpts={ratio:.8f}*PTS,"
-        f"minterpolate=fps={output_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+    # Interpolate only between the ORIGINAL neighboring frames. The internal
+    # frame rate is bounded so CPU usage and optical-flow synthesis stay sane.
+    desired_internal_fps = int(round(output_fps * min(max(ratio, 1.0), 3.0)))
+    internal_fps = max(output_fps, min(desired_internal_fps, max_interpolation_fps))
+
+    optional_sharpen = ""
+    if sharpen_amount > 0.001:
+        # Very restrained luma-only sharpening. Strong sharpening makes AI
+        # textures and interpolation errors look more synthetic.
+        optional_sharpen = f",unsharp=5:5:{sharpen_amount:.2f}:3:3:0.0"
+
+    common_tail = (
+        f"setpts={ratio:.8f}*PTS,"
+        f"fps={output_fps}:round=near"
+        f"{optional_sharpen},"
+        "tpad=stop_mode=clone:stop_duration=2"
+    )
+
+    anti_warp_filter = (
+        "format=yuv420p,setpts=PTS-STARTPTS,"
+        f"minterpolate=fps={internal_fps}:mi_mode=mci:mc_mode=obmc:"
+        "me_mode=bilat:me=epzs:mb_size=16:search_param=32:"
+        "vsbmc=0:scd=fdiff:scd_threshold=8,"
         f"{common_tail}"
     )
-    fallback_filter = (
-        f"format=yuv420p,setpts={ratio:.8f}*PTS,"
+
+    # No motion-compensated synthesis in the fallback. It only retimes and
+    # duplicates existing frames, so it cannot bend straight lines or create
+    # the liquid/wave artifact seen in aggressive optical flow.
+    no_warp_fallback_filter = (
+        "format=yuv420p,setpts=PTS-STARTPTS,"
         f"{common_tail}"
     )
 
@@ -489,34 +519,35 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
             "-crf", str(crf),
             "-profile:v", "high",
             "-pix_fmt", "yuv420p",
+            "-fps_mode", "cfr",
             "-movflags", "+faststart",
             output_path,
         ])
 
-    requested_strategy = "motion_interpolated_slowmo_sharpened" if use_motion_interpolation else "high_quality_slowmo_sharpened"
+    requested_strategy = "anti_warp_preinterpolated_slowmo" if use_motion_interpolation else "no_warp_frame_duplication_slowmo"
     strategy = requested_strategy
     interpolation_fallback_reason = ""
 
     log(
         f"POSTPROCESS START | source_path={input_path} | output_path={output_path} | "
         f"source_duration={source_duration:.3f}s | target_duration={target_duration_sec}s | "
-        f"ratio={ratio:.4f} | fps={output_fps} | crf={crf} | sharpen={sharpen_amount:.2f} | "
-        f"strategy={requested_strategy}"
+        f"ratio={ratio:.4f} | output_fps={output_fps} | internal_fps={internal_fps} | "
+        f"crf={crf} | sharpen={sharpen_amount:.2f} | strategy={requested_strategy}"
     )
 
     if use_motion_interpolation:
         try:
-            encode_with_filter(interpolation_filter)
+            encode_with_filter(anti_warp_filter)
         except RuntimeError as exc:
             interpolation_fallback_reason = str(exc)[-900:]
-            strategy = "high_quality_slowmo_sharpened_fallback"
+            strategy = "no_warp_frame_duplication_fallback"
             log(
-                "Motion interpolation failed; retrying with the high-quality sharpened fallback. "
+                "Anti-warp interpolation failed; retrying without optical flow. "
                 f"Reason: {interpolation_fallback_reason}"
             )
-            encode_with_filter(fallback_filter)
+            encode_with_filter(no_warp_fallback_filter)
     else:
-        encode_with_filter(fallback_filter)
+        encode_with_filter(no_warp_fallback_filter)
 
     if not Path(output_path).exists() or Path(output_path).stat().st_size < 2048:
         raise RuntimeError(f"Postprocess failed: output file not created or too small: {output_path}")
@@ -529,7 +560,7 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
 
     log(
         f"POSTPROCESS DONE | strategy={strategy} | final_duration={final_duration:.3f}s | "
-        f"fps={output_fps} | crf={crf}"
+        f"output_fps={output_fps} | internal_fps={internal_fps} | crf={crf}"
     )
     return {
         "extended": True,
@@ -539,14 +570,22 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
         "strategy": strategy,
         "slowmo_ratio": ratio,
         "motion_interpolation_requested": use_motion_interpolation,
-        "motion_interpolation_applied": strategy == "motion_interpolated_slowmo_sharpened",
+        "motion_interpolation_applied": strategy == "anti_warp_preinterpolated_slowmo",
+        "interpolation_order": "before_timestamp_stretch",
         "interpolation_fallback_reason": interpolation_fallback_reason,
         "output_fps": output_fps,
+        "internal_interpolation_fps": internal_fps,
         "x264_crf": crf,
         "x264_preset": preset,
         "sharpen_amount": sharpen_amount,
+        "anti_warp_settings": {
+            "mc_mode": "obmc",
+            "me_mode": "bilat",
+            "vsbmc": 0,
+            "scene_change_detection": "fdiff",
+            "scene_change_threshold": 8,
+        },
     }
-
 
 def normalize_gpt_voice(selection: str) -> str:
     value = _str(selection or "shimmer").lower()
