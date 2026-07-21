@@ -27,7 +27,7 @@ from openai import OpenAI
 
 # Locked model for this flow: Seedance 2.0 Mini Text-to-Video on Replicate.
 # Do not switch this endpoint to another model accidentally.
-REPLICATE_T2V_MODEL_ID_DEFAULT = "bytedance/seedance-2.0-mini"
+REPLICATE_T2V_MODEL_ID_DEFAULT = "bytedance/seedance-2.0"
 REPLICATE_T2V_MODEL_ID = REPLICATE_T2V_MODEL_ID_DEFAULT
 OPENAI_PLANNER_MODEL_DEFAULT = "gpt-4o-mini"
 OPENAI_TTS_MODEL_DEFAULT = "gpt-4o-mini-tts"
@@ -35,7 +35,7 @@ OPENAI_TTS_MODEL_DEFAULT = "gpt-4o-mini-tts"
 ALLOWED_ASPECT_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}
 TARGET_DURATION_RULES = {
     "8": {"source_duration": 4, "minimum_beats": 5, "narration_limit": 120},
-    "15": {"source_duration": 4, "minimum_beats": 5, "narration_limit": 225},
+    "15": {"source_duration": 4, "minimum_beats": 6, "narration_limit": 225},
     "30": {"source_duration": 5, "minimum_beats": 7, "narration_limit": 450},
     "60": {"source_duration": 7, "minimum_beats": 9, "narration_limit": 900},
 }
