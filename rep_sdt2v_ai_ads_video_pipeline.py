@@ -41,6 +41,16 @@ TARGET_DURATION_RULES = {
 }
 ALLOWED_TARGET_DURATIONS = set(TARGET_DURATION_RULES)
 VIDEO_QUALITY_RESOLUTIONS = {"eco": "480p", "premium": "720p"}
+EXPECTED_VIDEO_DIMENSIONS = {
+    "480p": {
+        "16:9": (864, 496), "4:3": (752, 560), "1:1": (640, 640),
+        "3:4": (560, 752), "9:16": (496, 864), "21:9": (992, 432),
+    },
+    "720p": {
+        "16:9": (1280, 720), "4:3": (1112, 834), "1:1": (960, 960),
+        "3:4": (834, 1112), "9:16": (720, 1280), "21:9": (1470, 630),
+    },
+}
 REPLICATE_SOURCE_DURATION_SEC_DEFAULT = 4
 REPLICATE_API_BASE = "https://api.replicate.com/v1"
 GPT_TTS_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar"}
@@ -64,6 +74,8 @@ MANDATORY_4K_QUALITY_SENTENCE = (
 )
 MANDATORY_PRODUCT_AD_SENTENCE = "Create a professional product advertising video."
 PLANNER_PROMPT_MAX_CHARS = 1500
+PLANNER_MAX_ATTEMPTS = 3
+PLANNER_BEAT_MAX_CHARS = 72
 
 
 def log(msg: str) -> None:
@@ -79,24 +91,122 @@ def normalize_aspect_ratio(value: Any) -> str:
     return value if value in ALLOWED_ASPECT_RATIOS else "9:16"
 
 
+def _quality_token(value: Any) -> str:
+    raw = re.sub(r"\s+", " ", _str(value)).strip().lower()
+    if not raw:
+        return ""
+    if "premium" in raw or "cao cấp" in raw or "cao cap" in raw or "720" in raw:
+        return "premium"
+    if "eco" in raw or "tiết kiệm" in raw or "tiet kiem" in raw or "480" in raw:
+        return "eco"
+    return ""
+
+
 def normalize_video_quality(job: Dict[str, Any]) -> str:
-    return "premium" if _str(job.get("resolution")).lower() == "720p" else "eco"
+    """
+    Resolve the user's quality choice without depending on one fragile field.
+
+    Explicit quality fields have priority over resolution fields because some
+    workers add a default resolution even when the frontend already sent the
+    user's Eco/Premium selection. Conflicting explicit quality fields are
+    rejected instead of silently producing the wrong tier.
+    """
+    explicit_keys = (
+        "video_quality", "quality", "quality_mode", "selected_quality",
+        "selected_video_quality", "videoQuality",
+    )
+    resolution_keys = ("resolution", "video_resolution", "output_resolution")
+
+    explicit_values = [
+        (key, _str(job.get(key)), _quality_token(job.get(key)))
+        for key in explicit_keys
+        if _str(job.get(key))
+    ]
+    recognized_explicit = [(key, raw, token) for key, raw, token in explicit_values if token]
+    explicit_tokens = {token for _, _, token in recognized_explicit}
+    if len(explicit_tokens) > 1:
+        raise ValueError(f"Conflicting video quality fields: {recognized_explicit}")
+
+    resolution_values = [
+        (key, _str(job.get(key)), _quality_token(job.get(key)))
+        for key in resolution_keys
+        if _str(job.get(key))
+    ]
+    recognized_resolution = [(key, raw, token) for key, raw, token in resolution_values if token]
+    resolution_tokens = {token for _, _, token in recognized_resolution}
+    if len(resolution_tokens) > 1:
+        raise ValueError(f"Conflicting video resolution fields: {recognized_resolution}")
+
+    if explicit_tokens:
+        selected = next(iter(explicit_tokens))
+        if resolution_tokens and selected not in resolution_tokens:
+            log(
+                "QUALITY CONFLICT | explicit quality wins over resolution default | "
+                f"explicit={recognized_explicit} | resolution={recognized_resolution}"
+            )
+        return selected
+
+    if resolution_tokens:
+        return next(iter(resolution_tokens))
+
+    supplied = explicit_values + resolution_values
+    if supplied:
+        raise ValueError(
+            "Unsupported video quality value. Use Eco/480p or Premium/720p. "
+            f"Received: {[(key, raw) for key, raw, _ in supplied]}"
+        )
+    raise ValueError(
+        "Missing video quality. Frontend/worker must send video_quality=eco|premium "
+        "or resolution=480p|720p."
+    )
 
 
 def get_video_resolution(video_quality: str) -> str:
-    return VIDEO_QUALITY_RESOLUTIONS.get(video_quality, VIDEO_QUALITY_RESOLUTIONS["eco"])
+    quality = _str(video_quality).lower()
+    if quality not in VIDEO_QUALITY_RESOLUTIONS:
+        raise ValueError(f"Unsupported normalized video quality: {video_quality}")
+    return VIDEO_QUALITY_RESOLUTIONS[quality]
 
 
 def normalize_target_duration(value: Any) -> str:
-    raw = _str(value, "8").lower()
+    raw = _str(value).lower()
+    if not raw:
+        raise ValueError("Missing target duration. Allowed values: 8s, 20s, 30s, 60s.")
     raw = raw.replace("seconds", "").replace("second", "").replace("giây", "").replace("s", "").strip()
     if raw.endswith(".0"):
         raw = raw[:-2]
-    return raw if raw in ALLOWED_TARGET_DURATIONS else "8"
+    if raw not in ALLOWED_TARGET_DURATIONS:
+        raise ValueError(
+            f"Unsupported target duration '{value}'. Allowed values: 8s, 20s, 30s, 60s."
+        )
+    return raw
+
+
+def extract_target_duration(job: Dict[str, Any]) -> str:
+    keys = (
+        "target_duration_sec", "target_duration", "duration", "duration_sec",
+        "output_duration", "selected_duration",
+    )
+    supplied = [(key, job.get(key)) for key in keys if _str(job.get(key))]
+    if not supplied:
+        raise ValueError(
+            "Missing target duration. Frontend/worker must send one of: "
+            "target_duration_sec, target_duration, duration, or duration_sec."
+        )
+
+    normalized = [(key, raw, normalize_target_duration(raw)) for key, raw in supplied]
+    values = {value for _, _, value in normalized}
+    if len(values) > 1:
+        raise ValueError(f"Conflicting target duration fields: {normalized}")
+    return normalized[0][2]
 
 
 def get_duration_rule(target_duration: str) -> Dict[str, int]:
-    return dict(TARGET_DURATION_RULES.get(str(target_duration), TARGET_DURATION_RULES["8"]))
+    key = normalize_target_duration(target_duration)
+    rule = TARGET_DURATION_RULES.get(key)
+    if not rule:
+        raise ValueError(f"No duration rule configured for {target_duration}")
+    return dict(rule)
 
 
 def normalize_narration(job: Dict[str, Any], limit: int) -> str:
@@ -164,6 +274,78 @@ def _json_loads_loose(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _normalize_planner_beats(value: Any, expected_count: int) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    beats: List[str] = []
+    for item in value:
+        beat = re.sub(r"\s+", " ", _str(item)).strip(" .;:-")
+        beat = re.sub(r"^(?:beat|shot|step)\s*\d+\s*[:.)-]?\s*", "", beat, flags=re.I)
+        beat = _clip_prompt_base(beat, PLANNER_BEAT_MAX_CHARS)
+        if beat:
+            beats.append(beat)
+    return beats if len(beats) == int(expected_count) else []
+
+
+def _fallback_beats(minimum_beats: int) -> List[str]:
+    middle = [
+        "Establish the subject and setting in a clean, stable hero composition",
+        "Begin a subtle camera move while the main subject remains sharp",
+        "Reveal an important material or visual detail through natural light",
+        "Show a physically plausible interaction or environmental response",
+        "Shift to a complementary angle while preserving identity and proportions",
+        "Add restrained cinematic motion that emphasizes depth and texture",
+        "Let the action settle naturally with stable lighting and realistic physics",
+    ]
+    count = max(1, int(minimum_beats))
+    selected = middle[:max(0, count - 1)]
+    while len(selected) < count - 1:
+        selected.append("Continue the coherent action with subtle realistic motion")
+    selected.append("Finish on a polished final hero frame, fully visible and in focus")
+    return [_clip_prompt_base(item, PLANNER_BEAT_MAX_CHARS) for item in selected[:count]]
+
+
+def compose_prompt_with_verified_beats(base_prompt: str, beats: List[str]) -> str:
+    normalized_beats = _normalize_planner_beats(beats, len(beats))
+    if not normalized_beats:
+        raise ValueError("Cannot compose prompt without a valid non-empty beat list.")
+
+    base = re.sub(r"\s+", " ", _str(base_prompt)).strip()
+    for sentence in (
+        MANDATORY_PRODUCT_AD_SENTENCE,
+        MANDATORY_NATURAL_ACTION_SENTENCE,
+        MANDATORY_4K_QUALITY_SENTENCE,
+    ):
+        base = base.replace(sentence, " ")
+    base = re.sub(r"\b(?:Beat|Shot|Step)\s*\d+\s*:\s*[^.]+\.?", " ", base, flags=re.I)
+    base = re.sub(r"\bAction sequence\s*:\s*", " ", base, flags=re.I)
+    base = re.sub(r"\s+", " ", base).strip(" ,;:")
+
+    beat_block = "Action sequence: " + " ".join(
+        f"Beat {index}: {beat}." for index, beat in enumerate(normalized_beats, 1)
+    )
+    mandatory_suffix = " ".join((
+        MANDATORY_PRODUCT_AD_SENTENCE,
+        MANDATORY_NATURAL_ACTION_SENTENCE,
+        MANDATORY_4K_QUALITY_SENTENCE,
+    ))
+    available = PLANNER_PROMPT_MAX_CHARS - len(beat_block) - len(mandatory_suffix) - 2
+    if available < 0:
+        raise RuntimeError("Verified beat sequence and mandatory sentences exceed prompt limit.")
+
+    clipped_base = _clip_prompt_base(base, available)
+    parts = [part for part in (clipped_base, beat_block, mandatory_suffix) if part]
+    final_prompt = " ".join(parts).strip()
+    marker_count = len(re.findall(r"\bBeat\s+\d+\s*:", final_prompt))
+    if marker_count != len(normalized_beats):
+        raise RuntimeError(
+            f"Final prompt beat validation failed: expected={len(normalized_beats)}, found={marker_count}."
+        )
+    if len(final_prompt) > PLANNER_PROMPT_MAX_CHARS:
+        raise RuntimeError("Final planner prompt exceeds the configured character limit.")
+    return final_prompt
+
+
 def build_planner_instruction(
     user_prompt: str,
     aspect_ratio: str,
@@ -171,26 +353,28 @@ def build_planner_instruction(
     source_duration: int,
     minimum_beats: int,
     resolution: str,
+    retry_reason: str = "",
 ) -> str:
+    correction = (
+        f"\nPrevious output was rejected because: {retry_reason}\n"
+        "Correct that error and return a completely valid JSON object."
+        if retry_reason else ""
+    )
     return f"""
-You are FlozenAI's professional short AI video prompt planner for Replicate Seedance Text-to-Video.
+You are Zizen Labs' professional short AI video prompt planner for Replicate Seedance Text-to-Video.
 
 Task:
 - Read ONLY the user's text input below.
-- Rewrite it into one concise, high-quality English video generation prompt.
-- The model source clip will be exactly {source_duration} seconds at {resolution} with no audio.
-- Keep one coherent subject and one coherent scene, but structure the motion as a continuous sequence of AT LEAST {minimum_beats} distinct visual/action beats.
-- Each beat must be concrete and visible: body movement, object interaction, environmental reaction, camera movement, or a clear change in framing.
+- Rewrite it into one concise, high-quality English video generation plan.
+- The source clip is exactly {source_duration} seconds at {resolution}, with no native audio.
+- Return EXACTLY {minimum_beats} distinct visual/action beats in the "beats" array: not fewer and not more.
+- Each beat must be one short, concrete, visible action or camera/environment change.
+- Keep one coherent subject and one coherent scene. Beats must form one continuous chronological action.
 - Keep the user's intent, subject, mood, style, setting, and requested actions.
-- Make the sequence physically plausible and temporally continuous so it remains stable during motion-interpolated extension to {target_duration} seconds.
-- Add cinematic camera language, lighting, temporal consistency, and artifact-prevention instructions.
-- If people/humans/faces are involved, integrate the human quality requirements compactly.
-- The final replicate_prompt must contain these three exact mandatory sentences, each exactly once:
-  1. {MANDATORY_PRODUCT_AD_SENTENCE}
-  2. {MANDATORY_NATURAL_ACTION_SENTENCE}
-  3. {MANDATORY_4K_QUALITY_SENTENCE}
-- The complete replicate_prompt, including all three mandatory sentences, must not exceed {PLANNER_PROMPT_MAX_CHARS} characters.
-- Do not include markdown. Output JSON only.
+- Prefer small, physically plausible movements that can fit naturally inside {source_duration} seconds.
+- Add cinematic camera language, realistic lighting, temporal consistency, and artifact prevention.
+- The "replicate_prompt" should describe the overall scene and style. Do not number beats inside it; the pipeline appends and validates the numbered beat sequence.
+- Do not include markdown. Output JSON only.{correction}
 
 User input, max 1500 chars:
 {user_prompt}
@@ -199,7 +383,7 @@ Selected settings:
 - aspect_ratio: {aspect_ratio}
 - replicate_generation_duration: {source_duration}s
 - user_target_duration_after_postprocess: {target_duration}s
-- minimum_beats: {minimum_beats}
+- exact_beat_count: {minimum_beats}
 - resolution: {resolution}
 - generate_audio: false
 
@@ -208,21 +392,27 @@ Human quality requirements to integrate compactly when relevant:
 
 Return JSON exactly:
 {{
-  "replicate_prompt": "final prompt here, max 1500 chars, including the three mandatory sentences exactly once"
+  "replicate_prompt": "overall scene, style, camera, lighting, realism and artifact-prevention prompt",
+  "beats": [
+    "visible action beat 1",
+    "visible action beat 2"
+  ]
 }}
+
+The beats array shown above is only structural. Your actual array must contain exactly {minimum_beats} items.
 """.strip()
 
 
 def fallback_prompt(user_prompt: str, source_duration: int, minimum_beats: int) -> str:
     base = user_prompt or "A professional cinematic short AI video with realistic motion and emotional visual storytelling."
-    prompt = (
+    overview = (
         f"{base}. Professional cinematic {source_duration}-second source video. "
-        f"Show one coherent continuous scene with at least {minimum_beats} distinct visible action beats, smoothly connected in chronological order. "
-        "Realistic natural motion, purposeful camera movement, stable composition, sharp details, natural lighting, clean depth of field, high-quality commercial look. "
+        "One coherent scene, realistic natural motion, purposeful restrained camera movement, "
+        "stable composition, sharp details, natural lighting, clean depth of field, and a premium commercial look. "
         "If human faces appear: sharp realistic face, crisp eyes, natural skin texture, correct anatomy, detailed hair. "
-        "No blurry faces, no warped faces, no distorted anatomy, no extra fingers, no missing limbs, no duplicate people, no watermark, no flicker, no AI artifacts. No audio."
+        "No blurry faces, warped faces, distorted anatomy, extra fingers, missing limbs, duplicate people, watermark, flicker, or AI artifacts. No audio."
     )
-    return ensure_mandatory_prompt_sentences(prompt)
+    return compose_prompt_with_verified_beats(overview, _fallback_beats(minimum_beats))
 
 
 def plan_replicate_prompt(
@@ -235,40 +425,92 @@ def plan_replicate_prompt(
     resolution: str,
 ) -> Dict[str, Any]:
     if not os.getenv("OPENAI_API_KEY"):
-        log("OPENAI_API_KEY missing; using fallback prompt.")
+        beats = _fallback_beats(minimum_beats)
+        log("OPENAI_API_KEY missing; using deterministic verified-beat fallback prompt.")
         return {
             "replicate_prompt": fallback_prompt(user_prompt, source_duration, minimum_beats),
             "planner_model": "fallback",
             "minimum_beats": minimum_beats,
+            "beats": beats,
+            "beat_count": len(beats),
+            "planner_attempts": 0,
+            "beat_validation_passed": True,
         }
 
     model = os.getenv("OPENAI_PLANNER_MODEL", OPENAI_PLANNER_MODEL_DEFAULT)
     client = OpenAI()
-    instruction = build_planner_instruction(
-        user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats, resolution
+    retry_reason = ""
+    last_data: Dict[str, Any] = {}
+
+    for attempt in range(1, PLANNER_MAX_ATTEMPTS + 1):
+        instruction = build_planner_instruction(
+            user_prompt, aspect_ratio, target_duration, source_duration,
+            minimum_beats, resolution, retry_reason
+        )
+        log(
+            f"Calling OpenAI planner: {model} | attempt={attempt}/{PLANNER_MAX_ATTEMPTS} | "
+            f"source={source_duration}s | exact_beats={minimum_beats} | resolution={resolution}"
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0.15,
+            max_tokens=900,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Return valid JSON only. The beats array must contain exactly the requested "
+                        "number of short visible action beats."
+                    ),
+                },
+                {"role": "user", "content": instruction},
+            ],
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = _json_loads_loose(content)
+        last_data = data
+        beats = _normalize_planner_beats(data.get("beats"), minimum_beats)
+        base_prompt = _str(data.get("replicate_prompt") or data.get("seedance_prompt"))
+
+        errors = []
+        if not base_prompt:
+            errors.append("replicate_prompt is missing or empty")
+        if not beats:
+            actual = len(data.get("beats")) if isinstance(data.get("beats"), list) else 0
+            errors.append(f"beats must contain exactly {minimum_beats} valid items; received {actual}")
+
+        if not errors:
+            prompt = compose_prompt_with_verified_beats(base_prompt, beats)
+            return {
+                "replicate_prompt": prompt,
+                "planner_model": model,
+                "raw_planner": data,
+                "minimum_beats": minimum_beats,
+                "beats": beats,
+                "beat_count": len(beats),
+                "planner_attempts": attempt,
+                "beat_validation_passed": True,
+            }
+
+        retry_reason = "; ".join(errors)
+        log(f"Planner output rejected | attempt={attempt} | reason={retry_reason}")
+
+    beats = _fallback_beats(minimum_beats)
+    log(
+        "Planner failed beat validation after all attempts; using deterministic "
+        f"verified-beat fallback. Last output={str(last_data)[:600]}"
     )
-    log(f"Calling OpenAI planner: {model} | source={source_duration}s | minimum_beats={minimum_beats}")
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        max_tokens=600,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "You rewrite user video ideas into concise Replicate Seedance prompts with the required number of visible action beats. Output valid JSON only."},
-            {"role": "user", "content": instruction},
-        ],
-    )
-    content = resp.choices[0].message.content or "{}"
-    data = _json_loads_loose(content)
-    prompt = _str(data.get("replicate_prompt") or data.get("seedance_prompt"))
-    if not prompt:
-        prompt = fallback_prompt(user_prompt, source_duration, minimum_beats)
-    prompt = ensure_mandatory_prompt_sentences(prompt)
     return {
-        "replicate_prompt": prompt,
-        "planner_model": model,
-        "raw_planner": data,
+        "replicate_prompt": fallback_prompt(user_prompt, source_duration, minimum_beats),
+        "planner_model": f"{model}:fallback",
+        "raw_planner": last_data,
         "minimum_beats": minimum_beats,
+        "beats": beats,
+        "beat_count": len(beats),
+        "planner_attempts": PLANNER_MAX_ATTEMPTS,
+        "beat_validation_passed": True,
+        "fallback_reason": retry_reason,
     }
 
 
@@ -442,6 +684,63 @@ def probe_duration_sec(path: str) -> float:
         return max(float(p.stdout.strip()), 0.1)
     except Exception:
         return float(REPLICATE_SOURCE_DURATION_SEC_DEFAULT)
+
+
+def probe_video_dimensions(path: str) -> Dict[str, int]:
+    p = _run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json", path,
+    ])
+    try:
+        payload = json.loads(p.stdout or "{}")
+        stream = (payload.get("streams") or [{}])[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+    except Exception as exc:
+        raise RuntimeError(f"Could not parse video dimensions for {path}: {exc}") from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Invalid video dimensions for {path}: {width}x{height}")
+    return {"width": width, "height": height}
+
+
+def validate_actual_resolution(
+    path: str, requested_resolution: str, aspect_ratio: str, stage: str
+) -> Dict[str, int]:
+    """Validate the actual Seedance tier using the documented size for each ratio.
+
+    A generic short-side threshold is not safe because 21:9 Premium is 1470x630,
+    whose short side is intentionally below 650 pixels. The ratio-aware table also
+    cleanly distinguishes every 480p output from its 720p counterpart.
+    """
+    dimensions = probe_video_dimensions(path)
+    expected_by_ratio = EXPECTED_VIDEO_DIMENSIONS.get(requested_resolution)
+    expected = expected_by_ratio.get(aspect_ratio) if expected_by_ratio else None
+    if not expected:
+        raise RuntimeError(
+            f"No expected dimensions configured for resolution={requested_resolution}, "
+            f"aspect_ratio={aspect_ratio}."
+        )
+
+    expected_width, expected_height = expected
+    actual_width = dimensions["width"]
+    actual_height = dimensions["height"]
+    tolerance = 0.90
+    width_ok = actual_width >= int(expected_width * tolerance)
+    height_ok = actual_height >= int(expected_height * tolerance)
+    if not (width_ok and height_ok):
+        raise RuntimeError(
+            f"{stage} resolution validation failed: requested={requested_resolution} "
+            f"at {aspect_ratio}, expected about {expected_width}x{expected_height}, "
+            f"actual={actual_width}x{actual_height}."
+        )
+
+    log(
+        f"{stage} RESOLUTION VERIFIED | requested={requested_resolution} | "
+        f"aspect_ratio={aspect_ratio} | expected={expected_width}x{expected_height} | "
+        f"actual={actual_width}x{actual_height}"
+    )
+    return dimensions
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -778,7 +1077,7 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     aspect_ratio = normalize_aspect_ratio(job.get("aspect_ratio"))
     video_quality = normalize_video_quality(job)
     resolution = get_video_resolution(video_quality)
-    target_duration = normalize_target_duration(job.get("target_duration_sec") or job.get("duration") or job.get("duration_sec"))
+    target_duration = extract_target_duration(job)
     target_duration_sec = int(target_duration)
     duration_rule = get_duration_rule(target_duration)
     source_duration = int(duration_rule["source_duration"])
@@ -787,10 +1086,24 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     narration = normalize_narration(job, narration_limit)
     generate_audio = bool(narration)
 
+    quality_inputs = {
+        key: job.get(key) for key in (
+            "video_quality", "quality", "quality_mode", "selected_quality",
+            "selected_video_quality", "videoQuality", "resolution",
+            "video_resolution", "output_resolution",
+        ) if _str(job.get(key))
+    }
+    duration_inputs = {
+        key: job.get(key) for key in (
+            "target_duration_sec", "target_duration", "duration", "duration_sec",
+            "output_duration", "selected_duration",
+        ) if _str(job.get(key))
+    }
     log(
         f"REQUEST SETTINGS | target={target_duration_sec}s | source={source_duration}s | "
-        f"minimum_beats={minimum_beats} | aspect_ratio={aspect_ratio} | "
-        f"video_quality={video_quality} | resolution={resolution} | generate_audio={generate_audio}"
+        f"minimum_beats={minimum_beats} | narration_limit={narration_limit} | "
+        f"aspect_ratio={aspect_ratio} | video_quality={video_quality} | resolution={resolution} | "
+        f"generate_audio={generate_audio} | quality_inputs={quality_inputs} | duration_inputs={duration_inputs}"
     )
     plan = plan_replicate_prompt(
         job, user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats, resolution
@@ -809,7 +1122,11 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     final_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_final.mp4"
     download_video(rep_result["replicate_video_url"], raw_path)
     source_duration_after_download = probe_duration_sec(raw_path)
-    log(f"SOURCE VIDEO READY | path={raw_path} | duration={source_duration_after_download:.3f}s")
+    source_dimensions = validate_actual_resolution(raw_path, resolution, aspect_ratio, "SOURCE")
+    log(
+        f"SOURCE VIDEO READY | path={raw_path} | duration={source_duration_after_download:.3f}s | "
+        f"dimensions={source_dimensions['width']}x{source_dimensions['height']}"
+    )
 
     extend_output_path = silent_path if generate_audio else final_path
     extend_info = extend_video_to_duration(raw_path, extend_output_path, target_duration_sec)
@@ -824,7 +1141,11 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     final_duration = probe_duration_sec(final_path)
     if final_duration < target_duration_sec - 0.45:
         raise RuntimeError(f"Final video is too short: target={target_duration_sec}s, actual={final_duration:.3f}s")
-    log(f"FINAL VIDEO READY | path={final_path} | duration={final_duration:.3f}s")
+    final_dimensions = validate_actual_resolution(final_path, resolution, aspect_ratio, "FINAL")
+    log(
+        f"FINAL VIDEO READY | path={final_path} | duration={final_duration:.3f}s | "
+        f"dimensions={final_dimensions['width']}x{final_dimensions['height']}"
+    )
 
     return {
         "local_path": final_path,
@@ -837,6 +1158,10 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         "prompt": prompt,
         "user_prompt": user_prompt,
         "minimum_beats": minimum_beats,
+        "beats": plan.get("beats", []),
+        "beat_count": int(plan.get("beat_count") or 0),
+        "beat_validation_passed": bool(plan.get("beat_validation_passed")),
+        "planner_attempts": int(plan.get("planner_attempts") or 0),
         "narration_text": narration,
         "narration_chars": len(narration),
         "narration_limit_chars": narration_limit,
@@ -847,6 +1172,8 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         "aspect_ratio": aspect_ratio,
         "video_quality": video_quality,
         "resolution": resolution,
+        "source_dimensions": source_dimensions,
+        "final_dimensions": final_dimensions,
         "duration": target_duration,
         "duration_sec": target_duration_sec,
         "final_duration_sec": final_duration,
