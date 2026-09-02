@@ -955,24 +955,49 @@ def get_runpod_status_url(run_url: str, request_id: str) -> str:
     return f"{clean}/status/{request_id}"
 
 
-def extract_audio_url(obj: Any) -> str:
-    if isinstance(obj, str) and obj.startswith("http"):
-        return obj
-    if isinstance(obj, list):
-        for item in obj:
-            url = extract_audio_url(item)
-            if url:
-                return url
-    if isinstance(obj, dict):
-        for key in ["audio_url", "result_audio_url", "output_url", "r2_url", "url"]:
-            value = obj.get(key)
-            if isinstance(value, str) and value.startswith("http"):
-                return value
-        for value in obj.values():
-            url = extract_audio_url(value)
-            if url:
-                return url
-    return ""
+def extract_omnivoice_audio_output(obj: Any) -> Dict[str, Any]:
+    data = obj if isinstance(obj, dict) else {}
+    output = data.get("output") if isinstance(data.get("output"), dict) else data
+    status = _str(data.get("status") or output.get("status")).upper()
+    audio_url = _str(
+        output.get("audio_url")
+        or output.get("result_audio_url")
+        or output.get("output_url")
+        or output.get("r2_url")
+        or output.get("url")
+        or data.get("audio_url")
+        or data.get("result_audio_url")
+    )
+    if audio_url and not audio_url.lower().startswith(("http://", "https://")):
+        audio_url = ""
+    error_message = _str(
+        output.get("error_message")
+        or output.get("error")
+        or data.get("error_message")
+        or data.get("error")
+    )
+    return {"status": status, "audio_url": audio_url, "error_message": error_message, "output": output}
+
+
+def probe_audio_duration_sec(path: str) -> float:
+    p = _run([
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=duration:format=duration", "-of", "json", path,
+    ])
+    try:
+        payload = json.loads(p.stdout or "{}")
+        streams = payload.get("streams") or []
+        if not streams:
+            raise ValueError("no audio stream")
+        stream_duration = streams[0].get("duration")
+        format_duration = (payload.get("format") or {}).get("duration")
+        raw = stream_duration if stream_duration not in (None, "", "N/A") else format_duration
+        duration = float(raw)
+    except Exception as exc:
+        raise RuntimeError(f"Could not determine audio duration for {path}: {exc}") from exc
+    if duration <= 0:
+        raise RuntimeError(f"Invalid audio duration for {path}: {duration}")
+    return duration
 
 
 def download_audio(audio_url: str, out_path: str) -> str:
@@ -996,9 +1021,10 @@ def call_omnivoice_tts(text: str, out_path: str, job: Dict[str, Any]) -> str:
     profile = job.get("voice_profile") or {}
     if not isinstance(profile, dict) or not profile.get("ref_audio_url"):
         raise RuntimeError("Missing voice_profile.ref_audio_url for OmniVoice TTS")
+    audio_job_id = f"audio_{_str(job.get('job_id'), uuid.uuid4().hex)}_{uuid.uuid4().hex[:8]}"
     payload = {
         "input": {
-            "job_id": f"audio_{uuid.uuid4().hex[:12]}",
+            "job_id": audio_job_id,
             "text": text,
             "prompt": text,
             "ref_audio_url": profile.get("ref_audio_url"),
@@ -1021,31 +1047,58 @@ def call_omnivoice_tts(text: str, out_path: str, job: Dict[str, Any]) -> str:
         data = {"raw": text_response}
     if not response.ok:
         raise RuntimeError(f"OmniVoice request failed: status={response.status_code}, body={text_response[:1000]}")
-    audio_url = extract_audio_url(data)
+
     request_id = data.get("id") or data.get("request_id") or data.get("runpod_request_id")
-    status = str(data.get("status", "")).upper()
-    if not audio_url and request_id:
+    extracted = extract_omnivoice_audio_output(data)
+    status = extracted["status"]
+    audio_url = extracted["audio_url"]
+    success_statuses = {"COMPLETED", "SUCCESS", "SUCCEEDED"}
+    failure_statuses = {"FAILED", "CANCELLED", "CANCELED", "TIMED_OUT"}
+
+    # /run is asynchronous. An output URL may become visible before the generating handler
+    # has actually finished, so only an explicit terminal-success status plus a generated
+    # audio URL is accepted as complete.
+    if request_id:
         status_url = get_runpod_status_url(run_url, str(request_id))
         deadline = time.time() + int(os.getenv("OMNIVOICE_POLL_TIMEOUT_SEC", "900"))
         while time.time() < deadline:
-            time.sleep(int(os.getenv("OMNIVOICE_POLL_INTERVAL_SEC", "4")))
+            if extracted["error_message"] or status in failure_statuses:
+                raise RuntimeError(
+                    f"OmniVoice failed: status={status}, error={extracted['error_message']}, response={str(data)[:1000]}"
+                )
+            if status in success_statuses:
+                if not audio_url:
+                    raise RuntimeError(
+                        f"OmniVoice reached terminal success without a generated audio URL: request_id={request_id}"
+                    )
+                break
+            time.sleep(max(1, int(os.getenv("OMNIVOICE_POLL_INTERVAL_SEC", "4"))))
             poll = requests.get(status_url, headers={"authorization": f"Bearer {key}"}, timeout=60)
             poll_text = poll.text
             try:
-                poll_data = poll.json()
+                data = poll.json()
             except Exception:
-                poll_data = {"raw": poll_text}
+                data = {"raw": poll_text}
             if not poll.ok:
                 raise RuntimeError(f"OmniVoice poll failed: status={poll.status_code}, body={poll_text[:1000]}")
-            audio_url = extract_audio_url(poll_data)
-            status = str(poll_data.get("status") or poll_data.get("output", {}).get("status") or "").upper()
-            if audio_url or status in {"COMPLETED", "FAILED", "CANCELLED", "CANCELED"}:
-                if status == "FAILED" and not audio_url:
-                    raise RuntimeError(f"OmniVoice failed: {str(poll_data)[:1000]}")
-                break
-    if not audio_url:
-        raise RuntimeError(f"Could not find audio URL in OmniVoice response: {str(data)[:1000]}")
-    return download_audio(audio_url, out_path)
+            extracted = extract_omnivoice_audio_output(data)
+            status = extracted["status"]
+            audio_url = extracted["audio_url"]
+        else:
+            raise RuntimeError(f"OmniVoice timed out before validated completion: request_id={request_id}, last_status={status}")
+    else:
+        if extracted["error_message"] or status not in success_statuses or not audio_url:
+            raise RuntimeError(
+                "OmniVoice response has no request id and is not a validated synchronous completion: "
+                f"status={status}, audio_url={bool(audio_url)}, error={extracted['error_message']}"
+            )
+
+    download_audio(audio_url, out_path)
+    audio_duration = probe_audio_duration_sec(out_path)
+    if audio_duration <= float(os.getenv("OMNIVOICE_MIN_VALID_AUDIO_SEC", "0.5")):
+        raise RuntimeError(f"OmniVoice completed audio is too short: {audio_duration:.3f}s")
+    log(f"OMNIVOICE AUDIO COMPLETE | parent_job={job.get('job_id')} | request_id={request_id or 'sync'} | duration={audio_duration:.3f}s")
+    return out_path
 
 
 def create_narration_tts(text: str, out_path: str, job: Dict[str, Any]) -> str:
@@ -1068,6 +1121,71 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str, duration
     return output_path
 
 
+def normalize_brand_name(job: Dict[str, Any]) -> str:
+    raw = _str(job.get("brand_name") or job.get("channel_name") or job.get("brand_text"))
+    return re.sub(r"\s+", " ", raw).strip()[:60]
+
+
+def apply_brand_overlay(input_path: str, output_path: str, brand_name: str, job_id: str) -> str:
+    brand = re.sub(r"[\r\n\t]+", " ", _str(brand_name)).strip()[:60]
+    if not brand:
+        if input_path != output_path:
+            Path(output_path).write_bytes(Path(input_path).read_bytes())
+        return output_path
+
+    configured_font = _str(os.getenv("ADS_BRAND_FONT_FILE"))
+    if configured_font and not Path(configured_font).exists():
+        raise RuntimeError(
+            f"ADS_BRAND_FONT_FILE points to a missing file: {configured_font}. "
+            "Remove the ENV to use automatic font discovery or set it to an existing Unicode font."
+        )
+    font_candidates = [
+        configured_font,
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    font_file = next((candidate for candidate in font_candidates if candidate and Path(candidate).exists()), "")
+    if not font_file:
+        try:
+            match = subprocess.run(
+                ["fc-match", "-f", "%{file}", "DejaVu Sans:style=Bold"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
+            )
+            discovered = _str(match.stdout)
+            if match.returncode == 0 and discovered and Path(discovered).exists():
+                font_file = discovered
+        except Exception:
+            font_file = ""
+    text_file = f"/tmp/{job_id}_brand.txt"
+    Path(text_file).write_text(brand, encoding="utf-8")
+    font_color = _str(os.getenv("ADS_BRAND_FONT_COLOR"), "white@0.94")
+    font_ratio = float(os.getenv("ADS_BRAND_FONT_SIZE_RATIO", "0.026"))
+    margin_ratio = float(os.getenv("ADS_BRAND_MARGIN_RATIO", "0.035"))
+    crf = str(_bounded_env_int("POSTPROCESS_CRF", 12, 0, 28))
+    preset = _str(os.getenv("POSTPROCESS_X264_PRESET"), "slow").lower()
+    if preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
+        preset = "slow"
+    font_arg = f"fontfile='{font_file}'" if font_file else "font='Sans'"
+    drawtext = (
+        f"drawtext={font_arg}:textfile='{text_file}':reload=0:"
+        f"fontcolor={font_color}:fontsize=h*{font_ratio:.4f}:"
+        f"x=w*{margin_ratio:.4f}:y=h-th-h*{margin_ratio:.4f}:"
+        "shadowcolor=black@0.72:shadowx=2:shadowy=2"
+    )
+    _run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", drawtext,
+        "-c:v", "libx264", "-preset", preset, "-crf", crf,
+        "-c:a", "copy", "-movflags", "+faststart", output_path,
+    ])
+    if not Path(output_path).exists() or Path(output_path).stat().st_size < 2048:
+        raise RuntimeError("Brand overlay output is missing or too small")
+    log(f"BRAND OVERLAY DONE | brand={brand!r} | position=bottom-left | font={font_file or 'fontconfig:Sans'}")
+    return output_path
+
+
 def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     job_id = _str(job.get("job_id"), uuid.uuid4().hex)
     user_prompt = normalize_user_prompt(job)
@@ -1085,6 +1203,7 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     narration_limit = int(duration_rule["narration_limit"])
     narration = normalize_narration(job, narration_limit)
     generate_audio = bool(narration)
+    brand_name = normalize_brand_name(job)
 
     quality_inputs = {
         key: job.get(key) for key in (
@@ -1103,7 +1222,7 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         f"REQUEST SETTINGS | target={target_duration_sec}s | source={source_duration}s | "
         f"minimum_beats={minimum_beats} | narration_limit={narration_limit} | "
         f"aspect_ratio={aspect_ratio} | video_quality={video_quality} | resolution={resolution} | "
-        f"generate_audio={generate_audio} | quality_inputs={quality_inputs} | duration_inputs={duration_inputs}"
+        f"generate_audio={generate_audio} | brand_name={brand_name!r} | quality_inputs={quality_inputs} | duration_inputs={duration_inputs}"
     )
     plan = plan_replicate_prompt(
         job, user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats, resolution
@@ -1119,6 +1238,7 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     )
     raw_path = f"/tmp/{job_id}_replicate_seedance_{source_duration}s_source.mp4"
     silent_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_silent.mp4"
+    muxed_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_muxed.mp4"
     final_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_final.mp4"
     download_video(rep_result["replicate_video_url"], raw_path)
     source_duration_after_download = probe_duration_sec(raw_path)
@@ -1128,15 +1248,42 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         f"dimensions={source_dimensions['width']}x{source_dimensions['height']}"
     )
 
-    extend_output_path = silent_path if generate_audio else final_path
+    extend_output_path = silent_path if generate_audio else (muxed_path if brand_name else final_path)
     extend_info = extend_video_to_duration(raw_path, extend_output_path, target_duration_sec)
     audio_duration = 0.0
     if generate_audio:
         audio_path = f"/tmp/{job_id}_narration.mp3"
+        audio_complete = False
         create_narration_tts(narration, audio_path, job)
-        audio_duration = probe_duration_sec(audio_path)
-        mux_video_audio(silent_path, audio_path, final_path, target_duration_sec)
-        log(f"AUDIO MUX DONE | voice_provider={job.get('voice_provider')} | audio_duration={audio_duration:.3f}s")
+        audio_duration = probe_audio_duration_sec(audio_path)
+        if audio_duration <= float(os.getenv("OMNIVOICE_MIN_VALID_AUDIO_SEC", "0.5")):
+            raise RuntimeError(f"Narration audio is too short to mux: {audio_duration:.3f}s")
+        overflow_tolerance = _bounded_env_float("ADS_AUDIO_MAX_OVERFLOW_SEC", 0.15, 0.0, 1.0)
+        if audio_duration > float(target_duration_sec) + overflow_tolerance:
+            raise RuntimeError(
+                f"Narration audio ({audio_duration:.3f}s) exceeds selected video duration ({target_duration_sec}s). "
+                "Refusing to truncate the narration; shorten the narration or choose a longer duration."
+            )
+        mux_target = muxed_path if brand_name else final_path
+        mux_video_audio(silent_path, audio_path, mux_target, target_duration_sec)
+        muxed_audio_duration = probe_audio_duration_sec(mux_target)
+        required_audio_duration = min(audio_duration, float(target_duration_sec))
+        if muxed_audio_duration + 0.12 < required_audio_duration:
+            raise RuntimeError(
+                f"Mux validation failed: source narration={audio_duration:.3f}s, "
+                f"muxed audio stream={muxed_audio_duration:.3f}s, target={target_duration_sec}s."
+            )
+        audio_complete = True
+        log(
+            f"AUDIO MUX VERIFIED | voice_provider={job.get('voice_provider')} | "
+            f"source_audio={audio_duration:.3f}s | muxed_audio={muxed_audio_duration:.3f}s"
+        )
+    else:
+        audio_complete = True
+
+    if brand_name:
+        source_for_overlay = muxed_path
+        apply_brand_overlay(source_for_overlay, final_path, brand_name, job_id)
 
     final_duration = probe_duration_sec(final_path)
     if final_duration < target_duration_sec - 0.45:
@@ -1168,6 +1315,8 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         "voice_selection": _str(job.get("voice_selection") or job.get("voice") or job.get("primary_voice") or job.get("tts_voice")),
         "voice_provider": _str(job.get("voice_provider")),
         "audio_duration_sec": audio_duration,
+        "audio_complete": bool(audio_complete),
+        "brand_name": brand_name,
         "replicate_elapsed_sec": rep_result.get("replicate_elapsed_sec", 0),
         "aspect_ratio": aspect_ratio,
         "video_quality": video_quality,

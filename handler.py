@@ -5,8 +5,10 @@ RunPod Serverless handler — Rep_sdt2v_AI__Ads_video_cpu.
 CPU orchestrator: GPT-4o-mini planner -> duration-specific Replicate Seedance source -> slow motion -> optional TTS mux -> R2 -> Cloudflare callback.
 """
 
+import asyncio
 import os
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
 import runpod
@@ -30,7 +32,7 @@ def _send_callback(callback_url: str, token: str, payload: Dict[str, Any]) -> No
         log(f"WARNING: callback failed: {e}")
 
 
-def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_job(event: Dict[str, Any]) -> Dict[str, Any]:
     job: Dict[str, Any] = event.get("input", {})
     job_id: str = str(job.get("job_id") or "unknown")
     callback_url = str(job.get("callback_url") or os.getenv("CALLBACK_URL") or "").strip()
@@ -44,6 +46,12 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         local_path: str = result["local_path"]
 
         log(f"Pipeline done. Local path: {local_path}")
+
+        if bool(result.get("generate_audio", False)) and (result.get("audio_complete") is not True or not (float(result.get("audio_duration_sec", 0) or 0) > 0)):
+            raise RuntimeError(
+                f"Refusing completed status because narration audio is not validated complete "
+                f"(audio_complete={result.get('audio_complete')}, audio_duration_sec={result.get('audio_duration_sec')})."
+            )
 
         r2_key = f"videos/{job_id}/output.mp4"
         public_url = upload_to_r2(local_path, r2_key)
@@ -73,7 +81,9 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             "voice_selection": result.get("voice_selection", ""),
             "voice_provider": result.get("voice_provider", ""),
             "audio_duration_sec": result.get("audio_duration_sec", 0),
+            "audio_complete": bool(result.get("audio_complete", not bool(result.get("generate_audio", False)))),
             "generate_audio": bool(result.get("generate_audio", False)),
+            "brand_name": result.get("brand_name", ""),
             "provider": "replicate_seedance_ai_product_ads_text_video",
             "pipeline_mode": "Rep_sdt2v_AI__Ads_video_cpu",
             "error_message": "",
@@ -105,4 +115,31 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         return output
 
 
-runpod.serverless.start({"handler": handler})
+def _read_worker_concurrency() -> int:
+    raw = os.getenv("RUNPOD_WORKER_CONCURRENCY", "1")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(value, 32))
+
+
+WORKER_CONCURRENCY = _read_worker_concurrency()
+JOB_EXECUTOR = ThreadPoolExecutor(max_workers=WORKER_CONCURRENCY, thread_name_prefix="ads-job")
+
+
+async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    # The ads pipeline is blocking (requests + ffmpeg). Give it a dedicated executor whose
+    # size is exactly the per-worker concurrency configured in RunPod ENV.
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(JOB_EXECUTOR, _handle_job, event)
+
+
+def _configured_concurrency(_: int) -> int:
+    return WORKER_CONCURRENCY
+
+
+runpod.serverless.start({
+    "handler": handler,
+    "concurrency_modifier": _configured_concurrency,
+})
