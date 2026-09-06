@@ -1,0 +1,51 @@
+# Required for fal.ai
+FAL_KEY=YOUR_FAL_API_KEY
+
+# Eco tier: Veo 3.1 Lite, 720p, silent source
+ADS_ECO_MODEL_ID=fal-ai/veo3.1/lite
+ADS_ECO_RESOLUTION=720p
+ADS_ECO_SOURCE_DURATION_SEC=4
+
+# Premium tier: Veo 3.1 Lite, 1080p, silent source
+ADS_PREMIUM_MODEL_ID=fal-ai/veo3.1/lite
+ADS_PREMIUM_RESOLUTION=1080p
+ADS_PREMIUM_SOURCE_DURATION_SEC=4
+
+# fal.ai queue / polling
+FAL_POLL_INTERVAL_SEC=5
+FAL_POLL_TIMEOUT_SEC=900
+FAL_REQUEST_TIMEOUT_SEC=120
+
+# Optional. Code already defaults to this; normally do not set it.
+# FAL_API_BASE=https://queue.fal.run
+
+# Optional extra Veo input fields, for example auto_fix / safety_tolerance.
+# duration, resolution, aspect_ratio and generate_audio are re-locked by code after this merge.
+# FAL_EXTRA_INPUT_JSON={"auto_fix":true,"safety_tolerance":"4"}
+
+# IMPORTANT:
+# Native Veo audio is intentionally hard-locked to false.
+# Existing ZizenLabs narration logic remains unchanged: TTS is generated separately and muxed locally.
+
+# Existing ENV values below remain as before:
+# R2_ACCOUNT_ID
+# R2_ACCESS_KEY_ID
+# R2_SECRET_ACCESS_KEY
+# R2_BUCKET / R2_BUCKET_NAME
+# R2_PUBLIC_BASE_URL
+# INTERNAL_CALLBACK_TOKEN
+# CALLBACK_URL
+# OPENAI_API_KEY
+# OPENAI_PLANNER_MODEL
+# RUNPOD_OMNIVOICE_ENDPOINT_URL
+# RUNPOD_OMNIVOICE_API_KEY
+# OPENAI_TTS_MODEL
+# RUNPOD_WORKER_CONCURRENCY
+# ...and existing postprocess variables if you use them.
+
+# These Replicate variables are NOT used by this updated ads flow anymore:
+# REPLICATE_API_TOKEN
+# REPLICATE_POLL_INTERVAL_SEC
+# REPLICATE_POLL_TIMEOUT_SEC
+# REPLICATE_EXTRA_INPUT_JSON
+# (Keep them only if other endpoints/flows still use Replicate.)
