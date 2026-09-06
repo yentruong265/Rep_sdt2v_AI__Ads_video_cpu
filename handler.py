@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """
 RunPod Serverless handler — Rep_sdt2v_AI__Ads_video_cpu.
-CPU orchestrator: GPT-4o-mini planner -> duration-specific Replicate Seedance source -> slow motion -> optional TTS mux -> R2 -> Cloudflare callback.
+CPU orchestrator: GPT-4o-mini planner -> duration-specific fal.ai Veo source -> slow motion -> optional TTS mux -> R2 -> Cloudflare callback.
 """
 
 import asyncio
@@ -65,8 +65,11 @@ def _handle_job(event: Dict[str, Any]) -> Dict[str, Any]:
             "progress_pct": 100,
             "result_video_key": r2_key,
             "result_video_url": public_url,
-            "replicate_video_url": result.get("replicate_video_url", ""),
-            "replicate_model": result.get("replicate_model", ""),
+            "fal_video_url": result.get("fal_video_url", result.get("replicate_video_url", "")),
+            "fal_model": result.get("fal_model", result.get("replicate_model", "")),
+            # Backward-compatible aliases retained for existing callback consumers.
+            "replicate_video_url": result.get("replicate_video_url", result.get("fal_video_url", "")),
+            "replicate_model": result.get("replicate_model", result.get("fal_model", "")),
             "replicate_source_duration": result.get("replicate_source_duration", ""),
             "postprocess_extend": result.get("postprocess_extend", {}),
             "planner_model": result.get("planner_model", ""),
@@ -75,7 +78,7 @@ def _handle_job(event: Dict[str, Any]) -> Dict[str, Any]:
             "aspect_ratio": result.get("aspect_ratio", ""),
             "duration": result.get("duration", ""),
             "duration_sec": result.get("duration_sec", 8),
-            "resolution": result.get("resolution", "480p"),
+            "resolution": result.get("resolution", "720p"),
             "minimum_beats": result.get("minimum_beats", 0),
             "narration_chars": result.get("narration_chars", 0),
             "voice_selection": result.get("voice_selection", ""),
@@ -84,7 +87,7 @@ def _handle_job(event: Dict[str, Any]) -> Dict[str, Any]:
             "audio_complete": bool(result.get("audio_complete", not bool(result.get("generate_audio", False)))),
             "generate_audio": bool(result.get("generate_audio", False)),
             "brand_name": result.get("brand_name", ""),
-            "provider": "replicate_seedance_ai_product_ads_text_video",
+            "provider": result.get("provider", "fal_veo31lite_ai_product_ads_text_video"),
             "pipeline_mode": "Rep_sdt2v_AI__Ads_video_cpu",
             "error_message": "",
         }
@@ -106,7 +109,7 @@ def _handle_job(event: Dict[str, Any]) -> Dict[str, Any]:
             "progress_pct": 100,
             "result_video_key": "",
             "result_video_url": "",
-            "provider": "replicate_seedance_ai_product_ads_text_video",
+            "provider": "fal_veo31lite_ai_product_ads_text_video",
             "pipeline_mode": "Rep_sdt2v_AI__Ads_video_cpu",
             "error_message": err,
             "traceback": tb[-4000:],

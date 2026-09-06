@@ -3,14 +3,14 @@ from __future__ import annotations
 """
 Zizen Labs — Rep_sdt2v_AI__Ads_video_cpu.
 CPU orchestrator only:
-User text -> GPT-4o-mini planner -> Replicate Seedance 2.0 Mini T2V at a duration-specific source length -> motion-interpolated high-quality extension -> optional TTS -> local mp4.
+User text -> GPT-4o-mini planner -> fal.ai Veo 3.1 Lite T2V at a duration-specific source length -> motion-interpolated high-quality extension -> optional TTS -> local mp4.
 
-Locked duration rules:
+Default duration rules (source duration can be overridden per tier from RunPod ENV):
 - 8s output: 4s source, at least 5 beats.
 - 20s output: 4s source, at least 7 beats.
 - 30s output: 4s source, at least 8 beats.
 - 60s output: 4s source, at least 8 beats.
-- Replicate uses Seedance 2.0 Mini with generate_audio=false: Eco=480p, Premium=720p; optional narration audio is generated separately and muxed locally.
+- fal.ai uses Veo 3.1 Lite with generate_audio=false: Eco=720p, Premium=1080p; optional narration audio is generated separately and muxed locally.
 """
 
 import json
@@ -25,14 +25,15 @@ from typing import Any, Dict, List
 import requests
 from openai import OpenAI
 
-# Locked model for this flow: Seedance 2.0 Mini Text-to-Video on Replicate.
-# Do not switch this endpoint to another model accidentally.
-REPLICATE_T2V_MODEL_ID_DEFAULT = "bytedance/seedance-2.0-mini"
-REPLICATE_T2V_MODEL_ID = REPLICATE_T2V_MODEL_ID_DEFAULT
+# Video provider defaults for this flow. Tier model/resolution/source duration can be changed from RunPod ENV.
+FAL_T2V_MODEL_ID_DEFAULT = "fal-ai/veo3.1/lite"
+FAL_API_BASE_DEFAULT = "https://queue.fal.run"
+FAL_SOURCE_DURATION_SEC_DEFAULT = 4
 OPENAI_PLANNER_MODEL_DEFAULT = "gpt-4o-mini"
 OPENAI_TTS_MODEL_DEFAULT = "gpt-4o-mini-tts"
 
 ALLOWED_ASPECT_RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}
+FAL_VEO_LITE_ASPECT_RATIOS = {"16:9", "9:16"}
 TARGET_DURATION_RULES = {
     "8": {"source_duration": 4, "minimum_beats": 5, "narration_limit": 120},
     "20": {"source_duration": 4, "minimum_beats": 7, "narration_limit": 300},
@@ -40,19 +41,15 @@ TARGET_DURATION_RULES = {
     "60": {"source_duration": 4, "minimum_beats": 8, "narration_limit": 900},
 }
 ALLOWED_TARGET_DURATIONS = set(TARGET_DURATION_RULES)
-VIDEO_QUALITY_RESOLUTIONS = {"eco": "480p", "premium": "720p"}
+VIDEO_QUALITY_RESOLUTIONS = {"eco": "720p", "premium": "1080p"}
 EXPECTED_VIDEO_DIMENSIONS = {
-    "480p": {
-        "16:9": (864, 496), "4:3": (752, 560), "1:1": (640, 640),
-        "3:4": (560, 752), "9:16": (496, 864), "21:9": (992, 432),
-    },
     "720p": {
-        "16:9": (1280, 720), "4:3": (1112, 834), "1:1": (960, 960),
-        "3:4": (834, 1112), "9:16": (720, 1280), "21:9": (1470, 630),
+        "16:9": (1280, 720), "9:16": (720, 1280),
+    },
+    "1080p": {
+        "16:9": (1920, 1080), "9:16": (1080, 1920),
     },
 }
-REPLICATE_SOURCE_DURATION_SEC_DEFAULT = 4
-REPLICATE_API_BASE = "https://api.replicate.com/v1"
 GPT_TTS_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar"}
 
 HUMAN_QUALITY_BLOCK = (
@@ -95,9 +92,9 @@ def _quality_token(value: Any) -> str:
     raw = re.sub(r"\s+", " ", _str(value)).strip().lower()
     if not raw:
         return ""
-    if "premium" in raw or "cao cấp" in raw or "cao cap" in raw or "720" in raw:
+    if "premium" in raw or "cao cấp" in raw or "cao cap" in raw or "1080" in raw:
         return "premium"
-    if "eco" in raw or "tiết kiệm" in raw or "tiet kiem" in raw or "480" in raw:
+    if "eco" in raw or "tiết kiệm" in raw or "tiet kiem" in raw or "720" in raw:
         return "eco"
     return ""
 
@@ -152,12 +149,12 @@ def normalize_video_quality(job: Dict[str, Any]) -> str:
     supplied = explicit_values + resolution_values
     if supplied:
         raise ValueError(
-            "Unsupported video quality value. Use Eco/480p or Premium/720p. "
+            "Unsupported video quality value. Use Eco/720p or Premium/1080p. "
             f"Received: {[(key, raw) for key, raw, _ in supplied]}"
         )
     raise ValueError(
         "Missing video quality. Frontend/worker must send video_quality=eco|premium "
-        "or resolution=480p|720p."
+        "or resolution=720p|1080p."
     )
 
 
@@ -361,7 +358,7 @@ def build_planner_instruction(
         if retry_reason else ""
     )
     return f"""
-You are Zizen Labs' professional short AI video prompt planner for Replicate Seedance Text-to-Video.
+You are Zizen Labs' professional short AI video prompt planner for fal.ai Veo 3.1 Lite Text-to-Video.
 
 Task:
 - Read ONLY the user's text input below.
@@ -381,7 +378,7 @@ User input, max 1500 chars:
 
 Selected settings:
 - aspect_ratio: {aspect_ratio}
-- replicate_generation_duration: {source_duration}s
+- source_generation_duration: {source_duration}s
 - user_target_duration_after_postprocess: {target_duration}s
 - exact_beat_count: {minimum_beats}
 - resolution: {resolution}
@@ -550,107 +547,239 @@ def first_video_url(result: Any) -> str:
     return ""
 
 
-def build_replicate_input(
+def _tier_env_prefix(video_quality: str) -> str:
+    quality = _str(video_quality).lower()
+    if quality == "eco":
+        return "ADS_ECO"
+    if quality == "premium":
+        return "ADS_PREMIUM"
+    raise ValueError(f"Unsupported normalized video quality: {video_quality}")
+
+
+def get_tier_model_id(video_quality: str) -> str:
+    prefix = _tier_env_prefix(video_quality)
+    return _str(os.getenv(f"{prefix}_MODEL_ID"), FAL_T2V_MODEL_ID_DEFAULT)
+
+
+def get_tier_resolution(video_quality: str) -> str:
+    prefix = _tier_env_prefix(video_quality)
+    default = VIDEO_QUALITY_RESOLUTIONS[video_quality]
+    resolution = _str(os.getenv(f"{prefix}_RESOLUTION"), default).lower()
+    if resolution not in {"720p", "1080p"}:
+        raise ValueError(
+            f"Unsupported {video_quality} resolution '{resolution}' for fal.ai Veo 3.1 Lite. "
+            "Allowed values: 720p, 1080p."
+        )
+    return resolution
+
+
+def get_tier_source_duration(video_quality: str, fallback_source_duration: int) -> int:
+    prefix = _tier_env_prefix(video_quality)
+    raw = _str(os.getenv(f"{prefix}_SOURCE_DURATION_SEC"), str(fallback_source_duration))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = int(fallback_source_duration)
+    if value not in {4, 6, 8}:
+        raise ValueError(
+            f"Unsupported {video_quality} source duration '{value}' for fal.ai Veo 3.1 Lite. "
+            "Allowed values: 4, 6, 8 seconds."
+        )
+    return value
+
+
+def build_fal_input(
     prompt: str,
     aspect_ratio: str,
     source_duration: int,
     resolution: str,
 ) -> Dict[str, Any]:
-    """Build a cost-locked Seedance input for the selected duration and quality rules."""
-    if resolution not in VIDEO_QUALITY_RESOLUTIONS.values():
-        raise ValueError(f"Unsupported Seedance resolution: {resolution}")
+    """Build a cost-locked fal.ai Veo input. Native model audio stays disabled by design."""
+    if resolution not in {"720p", "1080p"}:
+        raise ValueError(f"Unsupported fal.ai Veo 3.1 Lite resolution: {resolution}")
+    if aspect_ratio not in FAL_VEO_LITE_ASPECT_RATIOS:
+        raise ValueError(
+            f"fal.ai Veo 3.1 Lite supports only aspect_ratio 16:9 or 9:16; received {aspect_ratio}."
+        )
+    if int(source_duration) not in {4, 6, 8}:
+        raise ValueError(
+            f"fal.ai Veo 3.1 Lite supports only 4s, 6s, or 8s source duration; received {source_duration}s."
+        )
+
     input_payload = {
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
-        "duration": int(source_duration),
+        "duration": f"{int(source_duration)}s",
         "generate_audio": False,
     }
-    extra_json = os.getenv("REPLICATE_EXTRA_INPUT_JSON", "").strip()
+    extra_json = os.getenv("FAL_EXTRA_INPUT_JSON", "").strip()
     if extra_json:
         try:
             extra = json.loads(extra_json)
             if isinstance(extra, dict):
                 input_payload.update(extra)
         except Exception as e:
-            log(f"Ignoring invalid REPLICATE_EXTRA_INPUT_JSON: {e}")
+            log(f"Ignoring invalid FAL_EXTRA_INPUT_JSON: {e}")
 
-    # These three fields are hard-locked after optional extras so cost/audio rules cannot be overridden.
-    input_payload["duration"] = int(source_duration)
+    # These fields are hard-locked after optional extras so tier/cost/audio rules cannot be overridden.
+    input_payload["duration"] = f"{int(source_duration)}s"
     input_payload["resolution"] = resolution
     input_payload["generate_audio"] = False
+    input_payload["aspect_ratio"] = aspect_ratio
     log(
-        f"REPLICATE FINAL INPUT | duration={input_payload.get('duration')} | "
+        f"FAL FINAL INPUT | duration={input_payload.get('duration')} | "
         f"resolution={input_payload.get('resolution')} | generate_audio={input_payload.get('generate_audio')} | "
         f"aspect_ratio={input_payload.get('aspect_ratio')}"
     )
     return input_payload
 
 
-def call_replicate_t2v(
+def call_fal_t2v(
+    model_id: str,
     prompt: str,
     aspect_ratio: str,
     source_duration: int,
     resolution: str,
 ) -> Dict[str, Any]:
-    token = os.getenv("REPLICATE_API_TOKEN", "").strip()
+    token = _str(os.getenv("FAL_KEY") or os.getenv("FAL_API_KEY"))
     if not token:
-        raise RuntimeError("Missing REPLICATE_API_TOKEN environment variable.")
+        raise RuntimeError("Missing FAL_KEY (or FAL_API_KEY) environment variable.")
 
-    model_id = REPLICATE_T2V_MODEL_ID_DEFAULT
+    model_id = _str(model_id, FAL_T2V_MODEL_ID_DEFAULT).strip("/")
     if "/" not in model_id:
-        raise RuntimeError("Replicate model id must look like owner/model, for example bytedance/seedance-1.5-pro")
-    owner, model_name = model_id.split("/", 1)
-    url = f"{REPLICATE_API_BASE}/models/{owner}/{model_name}/predictions"
-    arguments = build_replicate_input(prompt, aspect_ratio, source_duration, resolution)
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Prefer": "wait=60"}
+        raise RuntimeError("fal.ai model id must look like owner/model, for example fal-ai/veo3.1/lite")
+
+    base = _str(os.getenv("FAL_API_BASE"), FAL_API_BASE_DEFAULT).rstrip("/")
+    submit_url = f"{base}/{model_id}"
+    arguments = build_fal_input(prompt, aspect_ratio, source_duration, resolution)
+    headers = {"Authorization": f"Key {token}", "Content-Type": "application/json"}
 
     log(
-        f"Calling Replicate {model_id} | source_duration={source_duration}s | "
-        f"resolution={resolution} | aspect_ratio={aspect_ratio}"
+        f"Calling fal.ai {model_id} | source_duration={source_duration}s | "
+        f"resolution={resolution} | aspect_ratio={aspect_ratio} | generate_audio=false"
     )
     start = time.time()
-    res = requests.post(url, headers=headers, json={"input": arguments}, timeout=90)
+    request_timeout = _bounded_env_int("FAL_REQUEST_TIMEOUT_SEC", 120, 30, 600)
+    res = requests.post(submit_url, headers=headers, json=arguments, timeout=request_timeout)
     text = res.text
     try:
-        pred = res.json()
+        queued = res.json()
     except Exception:
-        pred = {"raw": text}
+        queued = {"raw": text}
     if not res.ok:
-        raise RuntimeError(f"Replicate create prediction failed: status={res.status_code}, body={text[:1200]}")
+        raise RuntimeError(f"fal.ai submit failed: status={res.status_code}, body={text[:1200]}")
 
-    status = str(pred.get("status", "")).lower()
-    get_url = pred.get("urls", {}).get("get") or f"{REPLICATE_API_BASE}/predictions/{pred.get('id')}"
-    deadline = time.time() + int(os.getenv("REPLICATE_POLL_TIMEOUT_SEC", "900"))
-    while status not in {"succeeded", "failed", "canceled"}:
+    request_id = _str(queued.get("request_id") or queued.get("requestId"))
+    status_url = _str(queued.get("status_url") or queued.get("statusUrl"))
+    response_url = _str(queued.get("response_url") or queued.get("responseUrl"))
+    if not request_id:
+        # Some compatible endpoints can return the final payload synchronously.
+        video_url = first_video_url(queued.get("video")) or first_video_url(queued)
+        if video_url:
+            elapsed = time.time() - start
+            result_payload = queued
+            return {
+                "fal_video_url": video_url,
+                "fal_raw_result": result_payload,
+                "fal_elapsed_sec": elapsed,
+                "fal_model": model_id,
+                "fal_input": arguments,
+                # Backward-compatible aliases used by the current handler/output contract.
+                "replicate_video_url": video_url,
+                "replicate_raw_result": result_payload,
+                "replicate_elapsed_sec": elapsed,
+                "replicate_model": model_id,
+                "replicate_input": arguments,
+            }
+        raise RuntimeError(f"fal.ai submit response missing request_id: {str(queued)[:1200]}")
+
+    if not status_url or not response_url:
+        # Queue API normally returns both URLs; construct standard fal queue URLs as a defensive fallback.
+        request_base = f"{base}/{model_id}/requests/{request_id}"
+        status_url = status_url or f"{request_base}/status"
+        response_url = response_url or f"{request_base}/response"
+
+    deadline = time.time() + _bounded_env_int("FAL_POLL_TIMEOUT_SEC", 900, 60, 3600)
+    poll_interval = _bounded_env_int("FAL_POLL_INTERVAL_SEC", 5, 1, 60)
+    status = "IN_QUEUE"
+    last_status_payload: Dict[str, Any] = queued
+    failure_statuses = {"FAILED", "ERROR", "CANCELLED", "CANCELED", "TIMED_OUT"}
+
+    while status != "COMPLETED":
         if time.time() > deadline:
-            raise TimeoutError(f"Replicate prediction timed out after polling. prediction_id={pred.get('id')}")
-        time.sleep(int(os.getenv("REPLICATE_POLL_INTERVAL_SEC", "5")))
-        poll = requests.get(get_url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+            raise TimeoutError(f"fal.ai prediction timed out. request_id={request_id}, last_status={status}")
+        time.sleep(poll_interval)
+        poll = requests.get(status_url, headers={"Authorization": f"Key {token}"}, timeout=60)
         poll_text = poll.text
         try:
-            pred = poll.json()
+            last_status_payload = poll.json()
         except Exception:
-            pred = {"raw": poll_text}
+            last_status_payload = {"raw": poll_text}
         if not poll.ok:
-            raise RuntimeError(f"Replicate poll failed: status={poll.status_code}, body={poll_text[:1200]}")
-        status = str(pred.get("status", "")).lower()
-        log(f"Replicate status={status} prediction_id={pred.get('id')}")
+            raise RuntimeError(f"fal.ai status poll failed: status={poll.status_code}, body={poll_text[:1200]}")
+        status = _str(last_status_payload.get("status")).upper()
+        log(f"fal.ai status={status or 'UNKNOWN'} request_id={request_id}")
+        if status in failure_statuses:
+            raise RuntimeError(
+                f"fal.ai prediction ended with status={status}, error="
+                f"{last_status_payload.get('error') or last_status_payload.get('detail') or last_status_payload}"
+            )
+        if not status:
+            raise RuntimeError(f"fal.ai status response missing status: {str(last_status_payload)[:1200]}")
+
+    # fal queue can report COMPLETED while including an error/error_type field.
+    # Do not attempt to fetch or treat such a request as a successful video generation.
+    completed_error = last_status_payload.get("error") or last_status_payload.get("error_type")
+    if completed_error:
+        raise RuntimeError(
+            f"fal.ai prediction completed with error: request_id={request_id}, "
+            f"error={completed_error}"
+        )
+
+    result_res = requests.get(response_url, headers={"Authorization": f"Key {token}"}, timeout=120)
+    result_text = result_res.text
+    try:
+        result_payload = result_res.json()
+    except Exception:
+        result_payload = {"raw": result_text}
+    if not result_res.ok:
+        raise RuntimeError(f"fal.ai result fetch failed: status={result_res.status_code}, body={result_text[:1200]}")
 
     elapsed = time.time() - start
-    if status != "succeeded":
-        raise RuntimeError(f"Replicate prediction ended with status={status}, error={pred.get('error')}")
-    video_url = first_video_url(pred.get("output")) or first_video_url(pred)
+    video_url = first_video_url(result_payload.get("video")) or first_video_url(result_payload)
     if not video_url:
-        raise RuntimeError(f"Could not find video URL in Replicate result: {str(pred)[:1200]}")
+        raise RuntimeError(f"Could not find video URL in fal.ai result: {str(result_payload)[:1200]}")
     return {
+        "fal_video_url": video_url,
+        "fal_raw_result": result_payload,
+        "fal_elapsed_sec": elapsed,
+        "fal_model": model_id,
+        "fal_input": arguments,
+        # Backward-compatible aliases used by the current handler/output contract.
         "replicate_video_url": video_url,
-        "replicate_raw_result": pred,
+        "replicate_raw_result": result_payload,
         "replicate_elapsed_sec": elapsed,
         "replicate_model": model_id,
         "replicate_input": arguments,
     }
 
+
+# Backward-compatible function name for any caller that still imports the old symbol.
+def call_replicate_t2v(
+    prompt: str,
+    aspect_ratio: str,
+    source_duration: int,
+    resolution: str,
+    model_id: str | None = None,
+) -> Dict[str, Any]:
+    return call_fal_t2v(
+        model_id=model_id or FAL_T2V_MODEL_ID_DEFAULT,
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+        source_duration=source_duration,
+        resolution=resolution,
+    )
 
 def download_video(video_url: str, out_path: str) -> str:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -683,7 +812,7 @@ def probe_duration_sec(path: str) -> float:
     try:
         return max(float(p.stdout.strip()), 0.1)
     except Exception:
-        return float(REPLICATE_SOURCE_DURATION_SEC_DEFAULT)
+        return float(FAL_SOURCE_DURATION_SEC_DEFAULT)
 
 
 def probe_video_dimensions(path: str) -> Dict[str, int]:
@@ -707,11 +836,11 @@ def probe_video_dimensions(path: str) -> Dict[str, int]:
 def validate_actual_resolution(
     path: str, requested_resolution: str, aspect_ratio: str, stage: str
 ) -> Dict[str, int]:
-    """Validate the actual Seedance tier using the documented size for each ratio.
+    """Validate the actual configured video tier using expected dimensions for each ratio.
 
-    A generic short-side threshold is not safe because 21:9 Premium is 1470x630,
-    whose short side is intentionally below 650 pixels. The ratio-aware table also
-    cleanly distinguishes every 480p output from its 720p counterpart.
+    Use a ratio-aware expected-dimension table so 720p and 1080p outputs are
+    validated against the requested orientation without relying on one generic
+    short-side threshold.
     """
     dimensions = probe_video_dimensions(path)
     expected_by_ratio = EXPECTED_VIDEO_DIMENSIONS.get(requested_resolution)
@@ -1194,11 +1323,12 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
 
     aspect_ratio = normalize_aspect_ratio(job.get("aspect_ratio"))
     video_quality = normalize_video_quality(job)
-    resolution = get_video_resolution(video_quality)
+    resolution = get_tier_resolution(video_quality)
+    model_id = get_tier_model_id(video_quality)
     target_duration = extract_target_duration(job)
     target_duration_sec = int(target_duration)
     duration_rule = get_duration_rule(target_duration)
-    source_duration = int(duration_rule["source_duration"])
+    source_duration = get_tier_source_duration(video_quality, int(duration_rule["source_duration"]))
     minimum_beats = int(duration_rule["minimum_beats"])
     narration_limit = int(duration_rule["narration_limit"])
     narration = normalize_narration(job, narration_limit)
@@ -1221,7 +1351,7 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     log(
         f"REQUEST SETTINGS | target={target_duration_sec}s | source={source_duration}s | "
         f"minimum_beats={minimum_beats} | narration_limit={narration_limit} | "
-        f"aspect_ratio={aspect_ratio} | video_quality={video_quality} | resolution={resolution} | "
+        f"aspect_ratio={aspect_ratio} | video_quality={video_quality} | model_id={model_id} | resolution={resolution} | "
         f"generate_audio={generate_audio} | brand_name={brand_name!r} | quality_inputs={quality_inputs} | duration_inputs={duration_inputs}"
     )
     plan = plan_replicate_prompt(
@@ -1230,13 +1360,14 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = _str(plan.get("replicate_prompt") or plan.get("seedance_prompt")) or fallback_prompt(user_prompt, source_duration, minimum_beats)
     prompt = ensure_mandatory_prompt_sentences(prompt)
 
-    rep_result = call_replicate_t2v(
+    rep_result = call_fal_t2v(
+        model_id=model_id,
         prompt=prompt,
         aspect_ratio=aspect_ratio,
         source_duration=source_duration,
         resolution=resolution,
     )
-    raw_path = f"/tmp/{job_id}_replicate_seedance_{source_duration}s_source.mp4"
+    raw_path = f"/tmp/{job_id}_fal_veo31lite_{source_duration}s_source.mp4"
     silent_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_silent.mp4"
     muxed_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_muxed.mp4"
     final_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_final.mp4"
@@ -1297,8 +1428,11 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "local_path": final_path,
         "source_local_path": raw_path,
+        "fal_video_url": rep_result.get("fal_video_url", rep_result["replicate_video_url"]),
+        "fal_model": rep_result.get("fal_model", model_id),
+        "fal_input": rep_result.get("fal_input", rep_result.get("replicate_input", {})),
         "replicate_video_url": rep_result["replicate_video_url"],
-        "replicate_model": rep_result.get("replicate_model", REPLICATE_T2V_MODEL_ID),
+        "replicate_model": rep_result.get("replicate_model", model_id),
         "replicate_input": rep_result.get("replicate_input", {}),
         "planner_model": plan.get("planner_model", os.getenv("OPENAI_PLANNER_MODEL", OPENAI_PLANNER_MODEL_DEFAULT)),
         "planner": plan,
@@ -1317,6 +1451,7 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         "audio_duration_sec": audio_duration,
         "audio_complete": bool(audio_complete),
         "brand_name": brand_name,
+        "fal_elapsed_sec": rep_result.get("fal_elapsed_sec", rep_result.get("replicate_elapsed_sec", 0)),
         "replicate_elapsed_sec": rep_result.get("replicate_elapsed_sec", 0),
         "aspect_ratio": aspect_ratio,
         "video_quality": video_quality,
@@ -1330,7 +1465,7 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         "replicate_source_duration_sec": source_duration,
         "postprocess_extend": extend_info,
         "generate_audio": generate_audio,
-        "provider": "replicate_seedance_ai_product_ads_text_video",
+        "provider": "fal_veo31lite_ai_product_ads_text_video",
         "pipeline_mode": "Rep_sdt2v_AI__Ads_video_cpu",
     }
 
