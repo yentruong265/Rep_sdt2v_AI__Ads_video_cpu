@@ -17,8 +17,10 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -796,9 +798,17 @@ def download_video(video_url: str, out_path: str) -> str:
     return out_path
 
 
-def _run(cmd: List[str]) -> subprocess.CompletedProcess:
+def _run(cmd: List[str], timeout_sec: int | None = None) -> subprocess.CompletedProcess:
     log("Running: " + " ".join(cmd))
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        p = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=timeout_sec if timeout_sec and timeout_sec > 0 else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Command timed out after {timeout_sec}s: {' '.join(cmd)}"
+        ) from exc
     if p.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDOUT={p.stdout[-1000:]}\nSTDERR={p.stderr[-2000:]}")
     return p
@@ -893,7 +903,98 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return raw not in {"0", "false", "no", "off", "disabled"}
 
 
-def extend_video_to_duration(input_path: str, output_path: str, target_duration_sec: int) -> Dict[str, Any]:
+_EXECUTOR_INIT_LOCK = threading.Lock()
+_TTS_EXECUTOR: ThreadPoolExecutor | None = None
+_POSTPROCESS_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _get_tts_executor() -> ThreadPoolExecutor:
+    """Dedicated TTS pool so job threads can safely wait without executor starvation."""
+    global _TTS_EXECUTOR
+    if _TTS_EXECUTOR is None:
+        with _EXECUTOR_INIT_LOCK:
+            if _TTS_EXECUTOR is None:
+                default_workers = _bounded_env_int("RUNPOD_WORKER_CONCURRENCY", 1, 1, 32)
+                workers = _bounded_env_int("TTS_MAX_CONCURRENCY", default_workers, 1, 32)
+                _TTS_EXECUTOR = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ads-tts")
+                log(f"TTS executor initialized | max_workers={workers}")
+    return _TTS_EXECUTOR
+
+
+def _get_postprocess_executor() -> ThreadPoolExecutor:
+    """Bound heavy FFmpeg work independently from RunPod request concurrency."""
+    global _POSTPROCESS_EXECUTOR
+    if _POSTPROCESS_EXECUTOR is None:
+        with _EXECUTOR_INIT_LOCK:
+            if _POSTPROCESS_EXECUTOR is None:
+                workers = _bounded_env_int("POSTPROCESS_MAX_CONCURRENCY", 1, 1, 8)
+                _POSTPROCESS_EXECUTOR = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ads-ffmpeg")
+                log(f"Postprocess executor initialized | max_workers={workers}")
+    return _POSTPROCESS_EXECUTOR
+
+
+def _raise_if_future_failed(future: Future | None, checkpoint: str) -> None:
+    """Fail fast if the parallel audio branch has already ended with an error."""
+    if future is None or not future.done():
+        return
+    exc = future.exception()
+    if exc is not None:
+        raise RuntimeError(f"Parallel narration failed before {checkpoint}: {exc}") from exc
+
+
+def _build_brand_drawtext_filter(brand_name: str, job_id: str) -> str:
+    """Build the same brand overlay as before, but for the main postprocess pass."""
+    brand = re.sub(r"[\r\n\t]+", " ", _str(brand_name)).strip()[:60]
+    if not brand:
+        return ""
+
+    configured_font = _str(os.getenv("ADS_BRAND_FONT_FILE"))
+    if configured_font and not Path(configured_font).exists():
+        raise RuntimeError(
+            f"ADS_BRAND_FONT_FILE points to a missing file: {configured_font}. "
+            "Remove the ENV to use automatic font discovery or set it to an existing Unicode font."
+        )
+    font_candidates = [
+        configured_font,
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    font_file = next((candidate for candidate in font_candidates if candidate and Path(candidate).exists()), "")
+    if not font_file:
+        try:
+            match = subprocess.run(
+                ["fc-match", "-f", "%{file}", "DejaVu Sans:style=Bold"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
+            )
+            discovered = _str(match.stdout)
+            if match.returncode == 0 and discovered and Path(discovered).exists():
+                font_file = discovered
+        except Exception:
+            font_file = ""
+
+    text_file = f"/tmp/{job_id}_brand.txt"
+    Path(text_file).write_text(brand, encoding="utf-8")
+    font_color = _str(os.getenv("ADS_BRAND_FONT_COLOR"), "white@0.94")
+    font_ratio = float(os.getenv("ADS_BRAND_FONT_SIZE_RATIO", "0.026"))
+    margin_ratio = float(os.getenv("ADS_BRAND_MARGIN_RATIO", "0.035"))
+    font_arg = f"fontfile='{font_file}'" if font_file else "font='Sans'"
+    return (
+        f"drawtext={font_arg}:textfile='{text_file}':reload=0:"
+        f"fontcolor={font_color}:fontsize=h*{font_ratio:.4f}:"
+        f"x=w*{margin_ratio:.4f}:y=h-th-h*{margin_ratio:.4f}:"
+        "shadowcolor=black@0.72:shadowx=2:shadowy=2"
+    )
+
+
+def extend_video_to_duration(
+    input_path: str,
+    output_path: str,
+    target_duration_sec: int,
+    brand_name: str = "",
+    job_id: str = "",
+) -> Dict[str, Any]:
     """
     Extend a short source clip without asking optical flow to invent a very
     large number of frames after the clip has already been slowed down.
@@ -928,6 +1029,8 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
     preset = _str(os.getenv("POSTPROCESS_X264_PRESET"), "slow").lower()
     if preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
         preset = "slow"
+    ffmpeg_threads = _bounded_env_int("POSTPROCESS_FFMPEG_THREADS", 0, 0, 256)
+    brand_filter = _build_brand_drawtext_filter(brand_name, job_id) if brand_name else ""
 
     # Interpolate only between the ORIGINAL neighboring frames. The internal
     # frame rate is bounded so CPU usage and optical-flow synthesis stay sane.
@@ -940,10 +1043,12 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
         # textures and interpolation errors look more synthetic.
         optional_sharpen = f",unsharp=5:5:{sharpen_amount:.2f}:3:3:0.0"
 
+    brand_suffix = f",{brand_filter}" if brand_filter else ""
     common_tail = (
         f"setpts={ratio:.8f}*PTS,"
         f"fps={output_fps}:round=near"
-        f"{optional_sharpen},"
+        f"{optional_sharpen}"
+        f"{brand_suffix},"
         "tpad=stop_mode=clone:stop_duration=2"
     )
 
@@ -964,13 +1069,20 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
     )
 
     def encode_with_filter(filter_chain: str) -> None:
-        _run([
-            "ffmpeg", "-y", "-i", input_path,
+        cmd = ["ffmpeg", "-y"]
+        if ffmpeg_threads > 0:
+            cmd.extend(["-filter_threads", str(ffmpeg_threads)])
+        cmd.extend([
+            "-i", input_path,
             "-map", "0:v:0",
             "-filter:v", filter_chain,
             "-t", str(target_duration_sec),
             "-an",
             "-c:v", "libx264",
+        ])
+        if ffmpeg_threads > 0:
+            cmd.extend(["-threads", str(ffmpeg_threads)])
+        cmd.extend([
             "-preset", preset,
             "-crf", str(crf),
             "-profile:v", "high",
@@ -979,6 +1091,8 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
             "-movflags", "+faststart",
             output_path,
         ])
+        postprocess_timeout = _bounded_env_int("POSTPROCESS_TIMEOUT_SEC", 600, 60, 3600)
+        _run(cmd, timeout_sec=postprocess_timeout)
 
     requested_strategy = "anti_warp_preinterpolated_slowmo" if use_motion_interpolation else "no_warp_frame_duplication_slowmo"
     strategy = requested_strategy
@@ -988,7 +1102,8 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
         f"POSTPROCESS START | source_path={input_path} | output_path={output_path} | "
         f"source_duration={source_duration:.3f}s | target_duration={target_duration_sec}s | "
         f"ratio={ratio:.4f} | output_fps={output_fps} | internal_fps={internal_fps} | "
-        f"crf={crf} | sharpen={sharpen_amount:.2f} | strategy={requested_strategy}"
+        f"crf={crf} | sharpen={sharpen_amount:.2f} | strategy={requested_strategy} | "
+        f"brand_overlay={bool(brand_filter)} | ffmpeg_threads={ffmpeg_threads or 'auto'}"
     )
 
     if use_motion_interpolation:
@@ -1033,6 +1148,8 @@ def extend_video_to_duration(input_path: str, output_path: str, target_duration_
         "internal_interpolation_fps": internal_fps,
         "x264_crf": crf,
         "x264_preset": preset,
+        "ffmpeg_threads": ffmpeg_threads,
+        "brand_overlay_applied": bool(brand_filter),
         "sharpen_amount": sharpen_amount,
         "anti_warp_settings": {
             "mc_mode": "obmc",
@@ -1142,7 +1259,7 @@ def download_audio(audio_url: str, out_path: str) -> str:
     return out_path
 
 
-def call_omnivoice_tts(text: str, out_path: str, job: Dict[str, Any]) -> str:
+def call_omnivoice_tts(text: str, out_path: str, job: Dict[str, Any], cancel_event: threading.Event | None = None) -> str:
     url = _str(os.getenv("RUNPOD_OMNIVOICE_ENDPOINT_URL") or os.getenv("RUNPOD_OMNIVOICE_API_URL"))
     key = _str(os.getenv("RUNPOD_OMNIVOICE_API_KEY") or os.getenv("RUNPOD_API_KEY"))
     if not url or not key:
@@ -1168,6 +1285,10 @@ def call_omnivoice_tts(text: str, out_path: str, job: Dict[str, Any]) -> str:
     }
     run_url = normalize_runpod_run_url(url)
     headers = {"content-type": "application/json", "authorization": f"Bearer {key}"}
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("OmniVoice cancelled before submission because the video branch failed.")
+    tts_started = time.perf_counter()
+    log(f"OMNIVOICE SUBMIT | parent_job={job.get('job_id')} | audio_job={audio_job_id}")
     response = requests.post(run_url, headers=headers, json=payload, timeout=120)
     text_response = response.text
     try:
@@ -1189,19 +1310,36 @@ def call_omnivoice_tts(text: str, out_path: str, job: Dict[str, Any]) -> str:
     # audio URL is accepted as complete.
     if request_id:
         status_url = get_runpod_status_url(run_url, str(request_id))
-        deadline = time.time() + int(os.getenv("OMNIVOICE_POLL_TIMEOUT_SEC", "900"))
+        poll_timeout = int(os.getenv("OMNIVOICE_POLL_TIMEOUT_SEC", "900"))
+        poll_interval = max(1, int(os.getenv("OMNIVOICE_POLL_INTERVAL_SEC", "4")))
+        log_interval = _bounded_env_int("OMNIVOICE_STATUS_LOG_INTERVAL_SEC", 15, 5, 120)
+        deadline = time.time() + poll_timeout
+        last_logged_status = ""
+        last_log_at = 0.0
         while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("OmniVoice polling cancelled because the video branch failed.")
             if extracted["error_message"] or status in failure_statuses:
                 raise RuntimeError(
                     f"OmniVoice failed: status={status}, error={extracted['error_message']}, response={str(data)[:1000]}"
                 )
+            now = time.time()
+            if status != last_logged_status or now - last_log_at >= log_interval:
+                log(
+                    f"OMNIVOICE STATUS | parent_job={job.get('job_id')} | request_id={request_id} | "
+                    f"status={status or 'UNKNOWN'} | elapsed={time.perf_counter() - tts_started:.1f}s"
+                )
+                last_logged_status = status
+                last_log_at = now
             if status in success_statuses:
                 if not audio_url:
                     raise RuntimeError(
                         f"OmniVoice reached terminal success without a generated audio URL: request_id={request_id}"
                     )
                 break
-            time.sleep(max(1, int(os.getenv("OMNIVOICE_POLL_INTERVAL_SEC", "4"))))
+            time.sleep(poll_interval)
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("OmniVoice polling cancelled because the video branch failed.")
             poll = requests.get(status_url, headers={"authorization": f"Bearer {key}"}, timeout=60)
             poll_text = poll.text
             try:
@@ -1222,21 +1360,46 @@ def call_omnivoice_tts(text: str, out_path: str, job: Dict[str, Any]) -> str:
                 f"status={status}, audio_url={bool(audio_url)}, error={extracted['error_message']}"
             )
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("OmniVoice cancelled before audio download because the video branch failed.")
     download_audio(audio_url, out_path)
+    if cancel_event is not None and cancel_event.is_set():
+        try:
+            Path(out_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError("OmniVoice cancelled after audio download because the video branch failed.")
     audio_duration = probe_audio_duration_sec(out_path)
     if audio_duration <= float(os.getenv("OMNIVOICE_MIN_VALID_AUDIO_SEC", "0.5")):
         raise RuntimeError(f"OmniVoice completed audio is too short: {audio_duration:.3f}s")
-    log(f"OMNIVOICE AUDIO COMPLETE | parent_job={job.get('job_id')} | request_id={request_id or 'sync'} | duration={audio_duration:.3f}s")
+    log(
+        f"OMNIVOICE AUDIO COMPLETE | parent_job={job.get('job_id')} | request_id={request_id or 'sync'} | "
+        f"duration={audio_duration:.3f}s | elapsed={time.perf_counter() - tts_started:.1f}s"
+    )
     return out_path
 
 
-def create_narration_tts(text: str, out_path: str, job: Dict[str, Any]) -> str:
+def create_narration_tts(
+    text: str,
+    out_path: str,
+    job: Dict[str, Any],
+    cancel_event: threading.Event | None = None,
+) -> str:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Narration cancelled before generation because the video branch failed.")
     provider = _str(job.get("voice_provider")).lower()
     selection = _str(job.get("voice_selection") or job.get("voice") or job.get("primary_voice") or job.get("tts_voice") or "shimmer")
     profile = job.get("voice_profile")
     if provider in {"flozen_public_omnivoice", "flozen_clone_omnivoice", "omnivoice"} or isinstance(profile, dict):
-        return call_omnivoice_tts(text, out_path, job)
-    return create_openai_tts(text, out_path, selection)
+        return call_omnivoice_tts(text, out_path, job, cancel_event=cancel_event)
+    result = create_openai_tts(text, out_path, selection)
+    if cancel_event is not None and cancel_event.is_set():
+        try:
+            Path(out_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError("Narration cancelled after generation because the video branch failed.")
+    return result
 
 
 def mux_video_audio(video_path: str, audio_path: str, output_path: str, duration_sec: float) -> str:
@@ -1316,6 +1479,7 @@ def apply_brand_overlay(input_path: str, output_path: str, brand_name: str, job_
 
 
 def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
+    pipeline_started = time.perf_counter()
     job_id = _str(job.get("job_id"), uuid.uuid4().hex)
     user_prompt = normalize_user_prompt(job)
     if not user_prompt:
@@ -1334,6 +1498,11 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
     narration = normalize_narration(job, narration_limit)
     generate_audio = bool(narration)
     brand_name = normalize_brand_name(job)
+
+    raw_path = f"/tmp/{job_id}_fal_veo31lite_{source_duration}s_source.mp4"
+    silent_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_silent.mp4"
+    final_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_final.mp4"
+    audio_path = f"/tmp/{job_id}_narration.mp3"
 
     quality_inputs = {
         key: job.get(key) for key in (
@@ -1354,120 +1523,218 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         f"aspect_ratio={aspect_ratio} | video_quality={video_quality} | model_id={model_id} | resolution={resolution} | "
         f"generate_audio={generate_audio} | brand_name={brand_name!r} | quality_inputs={quality_inputs} | duration_inputs={duration_inputs}"
     )
-    plan = plan_replicate_prompt(
-        job, user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats, resolution
-    )
-    prompt = _str(plan.get("replicate_prompt") or plan.get("seedance_prompt")) or fallback_prompt(user_prompt, source_duration, minimum_beats)
-    prompt = ensure_mandatory_prompt_sentences(prompt)
 
-    rep_result = call_fal_t2v(
-        model_id=model_id,
-        prompt=prompt,
-        aspect_ratio=aspect_ratio,
-        source_duration=source_duration,
-        resolution=resolution,
-    )
-    raw_path = f"/tmp/{job_id}_fal_veo31lite_{source_duration}s_source.mp4"
-    silent_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_silent.mp4"
-    muxed_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_muxed.mp4"
-    final_path = f"/tmp/{job_id}_rep_sdt2v_ai_ads_video_final.mp4"
-    download_video(rep_result["replicate_video_url"], raw_path)
-    source_duration_after_download = probe_duration_sec(raw_path)
-    source_dimensions = validate_actual_resolution(raw_path, resolution, aspect_ratio, "SOURCE")
-    log(
-        f"SOURCE VIDEO READY | path={raw_path} | duration={source_duration_after_download:.3f}s | "
-        f"dimensions={source_dimensions['width']}x{source_dimensions['height']}"
-    )
+    audio_future: Future | None = None
+    audio_cancel_event = threading.Event()
+    stage_timings: Dict[str, float] = {}
 
-    extend_output_path = silent_path if generate_audio else (muxed_path if brand_name else final_path)
-    extend_info = extend_video_to_duration(raw_path, extend_output_path, target_duration_sec)
-    audio_duration = 0.0
+    # Start narration immediately after request validation. It uses only narration/voice data
+    # and can therefore overlap GPT planning, fal.ai generation, download and postprocessing.
     if generate_audio:
-        audio_path = f"/tmp/{job_id}_narration.mp3"
-        audio_complete = False
-        create_narration_tts(narration, audio_path, job)
-        audio_duration = probe_audio_duration_sec(audio_path)
-        if audio_duration <= float(os.getenv("OMNIVOICE_MIN_VALID_AUDIO_SEC", "0.5")):
-            raise RuntimeError(f"Narration audio is too short to mux: {audio_duration:.3f}s")
-        overflow_tolerance = _bounded_env_float("ADS_AUDIO_MAX_OVERFLOW_SEC", 0.15, 0.0, 1.0)
-        if audio_duration > float(target_duration_sec) + overflow_tolerance:
-            raise RuntimeError(
-                f"Narration audio ({audio_duration:.3f}s) exceeds selected video duration ({target_duration_sec}s). "
-                "Refusing to truncate the narration; shorten the narration or choose a longer duration."
-            )
-        mux_target = muxed_path if brand_name else final_path
-        mux_video_audio(silent_path, audio_path, mux_target, target_duration_sec)
-        muxed_audio_duration = probe_audio_duration_sec(mux_target)
-        required_audio_duration = min(audio_duration, float(target_duration_sec))
-        if muxed_audio_duration + 0.12 < required_audio_duration:
-            raise RuntimeError(
-                f"Mux validation failed: source narration={audio_duration:.3f}s, "
-                f"muxed audio stream={muxed_audio_duration:.3f}s, target={target_duration_sec}s."
-            )
-        audio_complete = True
-        log(
-            f"AUDIO MUX VERIFIED | voice_provider={job.get('voice_provider')} | "
-            f"source_audio={audio_duration:.3f}s | muxed_audio={muxed_audio_duration:.3f}s"
+        log(f"TTS QUEUED | parent_job={job_id} | provider={job.get('voice_provider')}")
+        audio_future = _get_tts_executor().submit(
+            create_narration_tts, narration, audio_path, job, audio_cancel_event
         )
-    else:
-        audio_complete = True
 
-    if brand_name:
-        source_for_overlay = muxed_path
-        apply_brand_overlay(source_for_overlay, final_path, brand_name, job_id)
+    try:
+        planner_started = time.perf_counter()
+        plan = plan_replicate_prompt(
+            job, user_prompt, aspect_ratio, target_duration, source_duration, minimum_beats, resolution
+        )
+        stage_timings["planner"] = time.perf_counter() - planner_started
+        log(f"STAGE DONE | planner | elapsed={stage_timings['planner']:.2f}s")
+        _raise_if_future_failed(audio_future, "fal.ai submission")
 
-    final_duration = probe_duration_sec(final_path)
-    if final_duration < target_duration_sec - 0.45:
-        raise RuntimeError(f"Final video is too short: target={target_duration_sec}s, actual={final_duration:.3f}s")
-    final_dimensions = validate_actual_resolution(final_path, resolution, aspect_ratio, "FINAL")
-    log(
-        f"FINAL VIDEO READY | path={final_path} | duration={final_duration:.3f}s | "
-        f"dimensions={final_dimensions['width']}x{final_dimensions['height']}"
-    )
+        # Prompt construction is intentionally unchanged.
+        prompt = _str(plan.get("replicate_prompt") or plan.get("seedance_prompt")) or fallback_prompt(user_prompt, source_duration, minimum_beats)
+        prompt = ensure_mandatory_prompt_sentences(prompt)
 
-    return {
-        "local_path": final_path,
-        "source_local_path": raw_path,
-        "fal_video_url": rep_result.get("fal_video_url", rep_result["replicate_video_url"]),
-        "fal_model": rep_result.get("fal_model", model_id),
-        "fal_input": rep_result.get("fal_input", rep_result.get("replicate_input", {})),
-        "replicate_video_url": rep_result["replicate_video_url"],
-        "replicate_model": rep_result.get("replicate_model", model_id),
-        "replicate_input": rep_result.get("replicate_input", {}),
-        "planner_model": plan.get("planner_model", os.getenv("OPENAI_PLANNER_MODEL", OPENAI_PLANNER_MODEL_DEFAULT)),
-        "planner": plan,
-        "prompt": prompt,
-        "user_prompt": user_prompt,
-        "minimum_beats": minimum_beats,
-        "beats": plan.get("beats", []),
-        "beat_count": int(plan.get("beat_count") or 0),
-        "beat_validation_passed": bool(plan.get("beat_validation_passed")),
-        "planner_attempts": int(plan.get("planner_attempts") or 0),
-        "narration_text": narration,
-        "narration_chars": len(narration),
-        "narration_limit_chars": narration_limit,
-        "voice_selection": _str(job.get("voice_selection") or job.get("voice") or job.get("primary_voice") or job.get("tts_voice")),
-        "voice_provider": _str(job.get("voice_provider")),
-        "audio_duration_sec": audio_duration,
-        "audio_complete": bool(audio_complete),
-        "brand_name": brand_name,
-        "fal_elapsed_sec": rep_result.get("fal_elapsed_sec", rep_result.get("replicate_elapsed_sec", 0)),
-        "replicate_elapsed_sec": rep_result.get("replicate_elapsed_sec", 0),
-        "aspect_ratio": aspect_ratio,
-        "video_quality": video_quality,
-        "resolution": resolution,
-        "source_dimensions": source_dimensions,
-        "final_dimensions": final_dimensions,
-        "duration": target_duration,
-        "duration_sec": target_duration_sec,
-        "final_duration_sec": final_duration,
-        "replicate_source_duration": str(source_duration),
-        "replicate_source_duration_sec": source_duration,
-        "postprocess_extend": extend_info,
-        "generate_audio": generate_audio,
-        "provider": "fal_veo31lite_ai_product_ads_text_video",
-        "pipeline_mode": "Rep_sdt2v_AI__Ads_video_cpu",
-    }
+        fal_started = time.perf_counter()
+        rep_result = call_fal_t2v(
+            model_id=model_id,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            source_duration=source_duration,
+            resolution=resolution,
+        )
+        stage_timings["fal"] = time.perf_counter() - fal_started
+        log(f"STAGE DONE | fal | elapsed={stage_timings['fal']:.2f}s")
+        _raise_if_future_failed(audio_future, "video download")
+
+        download_started = time.perf_counter()
+        download_video(rep_result["replicate_video_url"], raw_path)
+        source_duration_after_download = probe_duration_sec(raw_path)
+        source_dimensions = validate_actual_resolution(raw_path, resolution, aspect_ratio, "SOURCE")
+        stage_timings["download_validate"] = time.perf_counter() - download_started
+        log(
+            f"SOURCE VIDEO READY | path={raw_path} | duration={source_duration_after_download:.3f}s | "
+            f"dimensions={source_dimensions['width']}x{source_dimensions['height']} | "
+            f"elapsed={stage_timings['download_validate']:.2f}s"
+        )
+        _raise_if_future_failed(audio_future, "postprocess")
+
+        # Heavy FFmpeg work is queued in a dedicated pool. This lets the endpoint accept
+        # multiple jobs while independently limiting CPU-heavy postprocessing concurrency.
+        video_stage_path = silent_path if generate_audio else final_path
+        postprocess_queued = time.perf_counter()
+        log(f"POSTPROCESS QUEUED | parent_job={job_id}")
+        postprocess_future = _get_postprocess_executor().submit(
+            extend_video_to_duration,
+            raw_path,
+            video_stage_path,
+            target_duration_sec,
+            brand_name,
+            job_id,
+        )
+        # While waiting for the scarce CPU slot, react immediately if the parallel
+        # narration branch fails. If FFmpeg is still queued, cancel it so a failed job
+        # never consumes a postprocess slot. If FFmpeg is already running, let that one
+        # pass finish before raising so temp cleanup cannot race an active subprocess.
+        warned_audio_failed_while_running = False
+        audio_completion_checked = audio_future is None
+        while not postprocess_future.done():
+            watched = [postprocess_future]
+            if audio_future is not None and not audio_completion_checked:
+                watched.append(audio_future)
+            done, _ = wait(watched, return_when=FIRST_COMPLETED)
+            if audio_future is not None and audio_future in done and not audio_completion_checked:
+                audio_completion_checked = True
+                audio_exc = audio_future.exception()
+                if audio_exc is not None:
+                    if postprocess_future.cancel():
+                        raise RuntimeError(
+                            f"Parallel narration failed while postprocess was queued: {audio_exc}"
+                        ) from audio_exc
+                    if not warned_audio_failed_while_running:
+                        log(
+                            f"TTS FAILED WHILE POSTPROCESS RUNNING | parent_job={job_id} | "
+                            "waiting for current FFmpeg pass to finish safely"
+                        )
+                        warned_audio_failed_while_running = True
+        extend_info = postprocess_future.result()
+        stage_timings["postprocess_wait_and_run"] = time.perf_counter() - postprocess_queued
+        log(f"STAGE DONE | postprocess | elapsed={stage_timings['postprocess_wait_and_run']:.2f}s")
+        _raise_if_future_failed(audio_future, "audio join")
+
+        audio_duration = 0.0
+        if generate_audio:
+            audio_wait_started = time.perf_counter()
+            if audio_future is None:
+                raise RuntimeError("Narration future was not created for an audio-enabled job.")
+            if not audio_future.done():
+                log(f"TTS WAIT | parent_job={job_id} | video branch complete; waiting for narration")
+            audio_future.result()
+            stage_timings["audio_join_wait"] = time.perf_counter() - audio_wait_started
+
+            audio_duration = probe_audio_duration_sec(audio_path)
+            if audio_duration <= float(os.getenv("OMNIVOICE_MIN_VALID_AUDIO_SEC", "0.5")):
+                raise RuntimeError(f"Narration audio is too short to mux: {audio_duration:.3f}s")
+            overflow_tolerance = _bounded_env_float("ADS_AUDIO_MAX_OVERFLOW_SEC", 0.15, 0.0, 1.0)
+            if audio_duration > float(target_duration_sec) + overflow_tolerance:
+                raise RuntimeError(
+                    f"Narration audio ({audio_duration:.3f}s) exceeds selected video duration ({target_duration_sec}s). "
+                    "Refusing to truncate the narration; shorten the narration or choose a longer duration."
+                )
+
+            mux_started = time.perf_counter()
+            # Brand is already rendered in the single main video encode. Mux therefore copies
+            # the video stream and encodes only AAC audio.
+            mux_video_audio(silent_path, audio_path, final_path, target_duration_sec)
+            muxed_audio_duration = probe_audio_duration_sec(final_path)
+            required_audio_duration = min(audio_duration, float(target_duration_sec))
+            if muxed_audio_duration + 0.12 < required_audio_duration:
+                raise RuntimeError(
+                    f"Mux validation failed: source narration={audio_duration:.3f}s, "
+                    f"muxed audio stream={muxed_audio_duration:.3f}s, target={target_duration_sec}s."
+                )
+            stage_timings["audio_mux"] = time.perf_counter() - mux_started
+            audio_complete = True
+            log(
+                f"AUDIO MUX VERIFIED | voice_provider={job.get('voice_provider')} | "
+                f"source_audio={audio_duration:.3f}s | muxed_audio={muxed_audio_duration:.3f}s | "
+                f"mux_elapsed={stage_timings['audio_mux']:.2f}s"
+            )
+        else:
+            audio_complete = True
+
+        final_validate_started = time.perf_counter()
+        final_duration = probe_duration_sec(final_path)
+        if final_duration < target_duration_sec - 0.45:
+            raise RuntimeError(f"Final video is too short: target={target_duration_sec}s, actual={final_duration:.3f}s")
+        final_dimensions = validate_actual_resolution(final_path, resolution, aspect_ratio, "FINAL")
+        stage_timings["final_validate"] = time.perf_counter() - final_validate_started
+        stage_timings["pipeline_total"] = time.perf_counter() - pipeline_started
+        log(
+            f"FINAL VIDEO READY | path={final_path} | duration={final_duration:.3f}s | "
+            f"dimensions={final_dimensions['width']}x{final_dimensions['height']}"
+        )
+        log(
+            f"PIPELINE TIMING | parent_job={job_id} | total={stage_timings['pipeline_total']:.2f}s | "
+            f"planner={stage_timings.get('planner', 0):.2f}s | fal={stage_timings.get('fal', 0):.2f}s | "
+            f"download_validate={stage_timings.get('download_validate', 0):.2f}s | "
+            f"postprocess_wait_and_run={stage_timings.get('postprocess_wait_and_run', 0):.2f}s | "
+            f"audio_join_wait={stage_timings.get('audio_join_wait', 0):.2f}s | "
+            f"audio_mux={stage_timings.get('audio_mux', 0):.2f}s"
+        )
+
+        return {
+            "local_path": final_path,
+            "source_local_path": raw_path,
+            "fal_video_url": rep_result.get("fal_video_url", rep_result["replicate_video_url"]),
+            "fal_model": rep_result.get("fal_model", model_id),
+            "fal_input": rep_result.get("fal_input", rep_result.get("replicate_input", {})),
+            "replicate_video_url": rep_result["replicate_video_url"],
+            "replicate_model": rep_result.get("replicate_model", model_id),
+            "replicate_input": rep_result.get("replicate_input", {}),
+            "planner_model": plan.get("planner_model", os.getenv("OPENAI_PLANNER_MODEL", OPENAI_PLANNER_MODEL_DEFAULT)),
+            "planner": plan,
+            "prompt": prompt,
+            "user_prompt": user_prompt,
+            "minimum_beats": minimum_beats,
+            "beats": plan.get("beats", []),
+            "beat_count": int(plan.get("beat_count") or 0),
+            "beat_validation_passed": bool(plan.get("beat_validation_passed")),
+            "planner_attempts": int(plan.get("planner_attempts") or 0),
+            "narration_text": narration,
+            "narration_chars": len(narration),
+            "narration_limit_chars": narration_limit,
+            "voice_selection": _str(job.get("voice_selection") or job.get("voice") or job.get("primary_voice") or job.get("tts_voice")),
+            "voice_provider": _str(job.get("voice_provider")),
+            "audio_duration_sec": audio_duration,
+            "audio_complete": bool(audio_complete),
+            "brand_name": brand_name,
+            "fal_elapsed_sec": rep_result.get("fal_elapsed_sec", rep_result.get("replicate_elapsed_sec", 0)),
+            "replicate_elapsed_sec": rep_result.get("replicate_elapsed_sec", 0),
+            "aspect_ratio": aspect_ratio,
+            "video_quality": video_quality,
+            "resolution": resolution,
+            "source_dimensions": source_dimensions,
+            "final_dimensions": final_dimensions,
+            "duration": target_duration,
+            "duration_sec": target_duration_sec,
+            "final_duration_sec": final_duration,
+            "replicate_source_duration": str(source_duration),
+            "replicate_source_duration_sec": source_duration,
+            "postprocess_extend": extend_info,
+            "stage_timings_sec": stage_timings,
+            "generate_audio": generate_audio,
+            "provider": "fal_veo31lite_ai_product_ads_text_video",
+            "pipeline_mode": "Rep_sdt2v_AI__Ads_video_cpu",
+        }
+    except Exception:
+        # Best-effort stop of the local parallel audio branch if the video branch fails.
+        # OmniVoice polling checks this event between polls, preventing needless local waiting/download.
+        if audio_future is not None and not audio_future.done():
+            audio_cancel_event.set()
+            cancelled = audio_future.cancel()
+            if not cancelled:
+                try:
+                    audio_future.result(timeout=_bounded_env_int("TTS_CANCEL_JOIN_TIMEOUT_SEC", 10, 1, 60))
+                except FutureTimeoutError:
+                    log(f"WARNING: TTS branch did not stop within cancellation join timeout | parent_job={job_id}")
+                except Exception:
+                    pass
+        raise
 
 
 # Compatibility aliases for callers that use a generic text-to-video function name.

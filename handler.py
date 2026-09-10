@@ -7,7 +7,9 @@ CPU orchestrator: GPT-4o-mini planner -> duration-specific fal.ai Veo source -> 
 
 import asyncio
 import os
+import time
 import traceback
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
@@ -32,12 +34,34 @@ def _send_callback(callback_url: str, token: str, payload: Dict[str, Any]) -> No
         log(f"WARNING: callback failed: {e}")
 
 
+def _cleanup_job_temp_files(job_id: str) -> None:
+    """Remove only temp files created by this ads job; never touch other jobs."""
+    prefix = f"{job_id}_"
+    removed = 0
+    try:
+        for path in Path("/tmp").iterdir():
+            if path.is_file() and path.name.startswith(prefix):
+                try:
+                    path.unlink()
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:
+                    log(f"WARNING: temp cleanup failed for {path}: {exc}")
+        if removed:
+            log(f"TEMP CLEANUP DONE | job={job_id} | files_removed={removed}")
+    except Exception as exc:
+        log(f"WARNING: temp cleanup scan failed for job={job_id}: {exc}")
+
+
 def _handle_job(event: Dict[str, Any]) -> Dict[str, Any]:
     job: Dict[str, Any] = event.get("input", {})
     job_id: str = str(job.get("job_id") or "unknown")
+    has_real_job_id = bool(job.get("job_id"))
     callback_url = str(job.get("callback_url") or os.getenv("CALLBACK_URL") or "").strip()
     token = os.getenv("INTERNAL_CALLBACK_TOKEN", "")
 
+    job_started = time.perf_counter()
     log(f"=== JOB START: {job_id} ===")
     log(f"Job type: {job.get('job_type')} | pipeline_mode: {job.get('pipeline_mode')}")
 
@@ -116,6 +140,15 @@ def _handle_job(event: Dict[str, Any]) -> Dict[str, Any]:
         }
         _send_callback(callback_url, token, output)
         return output
+    finally:
+        # Preserve the original external job_id contract. Cleanup is scoped only when
+        # the request supplied a real job_id, so malformed/id-less jobs cannot delete
+        # temp files belonging to another concurrent invocation.
+        if has_real_job_id:
+            _cleanup_job_temp_files(job_id)
+        else:
+            log("WARNING: temp cleanup skipped because request had no job_id")
+        log(f"JOB RELEASED | job={job_id} | total_elapsed={time.perf_counter() - job_started:.2f}s")
 
 
 def _read_worker_concurrency() -> int:
