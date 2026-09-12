@@ -71,6 +71,7 @@ MANDATORY_4K_QUALITY_SENTENCE = (
     "stable clarity, and professional cinematic rendering. The entire video must look exceptionally lifelike, "
     "vivid, natural, and convincingly real, with realistic motion, lighting, depth, materials, and physical behavior."
 )
+MANDATORY_SHARP_NO_AI_ERROR_SENTENCE = "The image quality must be sharp and free from any AI errors."
 MANDATORY_PRODUCT_AD_SENTENCE = "Create a professional product advertising video."
 PLANNER_PROMPT_MAX_CHARS = 1500
 PLANNER_MAX_ATTEMPTS = 3
@@ -233,12 +234,122 @@ def _clip_prompt_base(text: str, max_chars: int) -> str:
     return clipped
 
 
+_VIETNAMESE_HINT_WORDS = frozenset(
+    "hay mot va voi khong cua cho trong duoc phai tao quay lam sau dau tien cuoi cung "
+    "quang cao san pham nguoi mau chat luong sac net chan thuc dien anh hinh canh "
+    "co gai chang trai dan ong phu nu buoc cham nhanh qua pho duong nha hang mon "
+    "bep dat xuong them roi dang khi luc nhin ngoi sang nen phia truoc ben trai phai gan xa ro rang tu nhien dep "
+    "chiec vay nhe giua gio nhu nhung nay kia rat that tung moi neu thi de den vao len tren duoi quanh hoac van".split()
+)
+_VIETNAMESE_DIACRITIC_CHARS = frozenset(
+    "ăâđêôơưĂÂĐÊÔƠƯ"
+    "àáạảãằắặẳẵầấậẩẫèéẹẻẽềếệểễìíịỉĩ"
+    "òóọỏõồốộổỗờớợởỡùúụủũừứựửữỳýỵỷỹ"
+    "ÀÁẠẢÃẰẮẶẲẴẦẤẬẨẪÈÉẸẺẼỀẾỆỂỄÌÍỊỈĨ"
+    "ÒÓỌỎÕỒỐỘỔỖỜỚỢỞỠÙÚỤỦŨỪỨỰỬỮỲÝỴỶỸ"
+)
+_VIETNAMESE_PHRASE_PATTERN = re.compile(
+    r"\b(?:hay\s+tao|quang\s+cao|san\s+pham|nguoi\s+mau|chat\s+luong|sac\s+net|"
+    r"chan\s+thuc|dien\s+anh|sau\s+do|dau\s+tien|cuoi\s+cung|co\s+gai|chang\s+trai|"
+    r"nguoi\s+dan\s+ong|phu\s+nu|cua\s+hang)\b",
+    flags=re.I,
+)
+
+def _fold_prompt_language_text(text: str) -> str:
+    import unicodedata
+
+    value = _str(text).lower().replace("đ", "d")
+    value = "".join(
+        ch for ch in unicodedata.normalize("NFD", value)
+        if unicodedata.category(ch) != "Mn"
+    )
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+def _contains_vietnamese_prompt_text(text: str) -> bool:
+    """Detect Vietnamese prose without rejecting an isolated Vietnamese brand/product name inside English text."""
+    original = _str(text)
+    folded = _fold_prompt_language_text(original)
+    if not folded:
+        return False
+    tokens = re.findall(r"[a-z]+", folded)
+    if len(tokens) < 3:
+        return False
+
+    hits = [1 if token in _VIETNAMESE_HINT_WORDS else 0 for token in tokens]
+    total_hits = sum(hits)
+    hit_ratio = total_hits / max(len(tokens), 1)
+
+    # Accented Vietnamese prose is a strong signal. Use density instead of a raw
+    # character check so an English prompt may still preserve names such as Hội An
+    # or Cà Phê Sữa Đá without being rejected.
+    alpha_chars = [ch for ch in original if ch.isalpha()]
+    diacritic_hits = sum(1 for ch in alpha_chars if ch in _VIETNAMESE_DIACRITIC_CHARS)
+    if len(tokens) >= 5 and diacritic_hits >= 2 and diacritic_hits / max(len(alpha_chars), 1) >= 0.08:
+        return True
+
+    # Strong multi-word Vietnamese phrases are a direct prose signal.
+    if _VIETNAMESE_PHRASE_PATTERN.search(folded) and total_hits >= 2:
+        return True
+
+    # Catch a Vietnamese sentence embedded inside a longer English provider prompt.
+    window_size = min(8, len(tokens))
+    for start in range(0, len(tokens) - window_size + 1):
+        if sum(hits[start:start + window_size]) >= 3:
+            return True
+
+    # Catch short Vietnamese/unaccented-Vietnamese prose while allowing isolated names.
+    return total_hits >= 3 and hit_ratio >= 0.20
+
+
+def translate_prompt_text_to_english(text: str) -> str:
+    """Translate fallback prompt prose to English while preserving proper nouns and product/brand names."""
+    cleaned = re.sub(r"\s+", " ", _str(text)).strip()
+    if not cleaned or not _contains_vietnamese_prompt_text(cleaned):
+        return cleaned
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "OPENAI_API_KEY is required to translate a non-English fallback prompt before sending it to the video provider."
+        )
+
+    client = OpenAI()
+    model = os.getenv("OPENAI_PLANNER_MODEL", OPENAI_PLANNER_MODEL_DEFAULT)
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0.0,
+        max_tokens=700,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Translate the supplied video-generation text into natural English only. "
+                    "Preserve proper nouns, brand names, product names, numbers, and concrete visual intent. "
+                    "Do not add new ideas. Return only the translated English text."
+                ),
+            },
+            {"role": "user", "content": cleaned},
+        ],
+    )
+    translated = re.sub(r"\s+", " ", _str(response.choices[0].message.content)).strip()
+    if not translated or _contains_vietnamese_prompt_text(translated):
+        raise RuntimeError("Could not normalize fallback video prompt to English.")
+    return translated
+
+
+def assert_provider_prompt_is_english(prompt: str) -> None:
+    """Final safety gate: never submit obvious Vietnamese prose to FAL/Replicate-compatible video providers."""
+    if _contains_vietnamese_prompt_text(prompt):
+        raise RuntimeError(
+            "Final video-provider prompt still contains Vietnamese prose; submission blocked because provider prompts must be English."
+        )
+
+
 def ensure_mandatory_prompt_sentences(prompt: str) -> str:
     base = re.sub(r"\s+", " ", _str(prompt)).strip()
     mandatory_sentences = (
         MANDATORY_PRODUCT_AD_SENTENCE,
         MANDATORY_NATURAL_ACTION_SENTENCE,
         MANDATORY_4K_QUALITY_SENTENCE,
+        MANDATORY_SHARP_NO_AI_ERROR_SENTENCE,
     )
     for sentence in mandatory_sentences:
         base = base.replace(sentence, " ")
@@ -314,6 +425,7 @@ def compose_prompt_with_verified_beats(base_prompt: str, beats: List[str]) -> st
         MANDATORY_PRODUCT_AD_SENTENCE,
         MANDATORY_NATURAL_ACTION_SENTENCE,
         MANDATORY_4K_QUALITY_SENTENCE,
+        MANDATORY_SHARP_NO_AI_ERROR_SENTENCE,
     ):
         base = base.replace(sentence, " ")
     base = re.sub(r"\b(?:Beat|Shot|Step)\s*\d+\s*:\s*[^.]+\.?", " ", base, flags=re.I)
@@ -327,6 +439,7 @@ def compose_prompt_with_verified_beats(base_prompt: str, beats: List[str]) -> st
         MANDATORY_PRODUCT_AD_SENTENCE,
         MANDATORY_NATURAL_ACTION_SENTENCE,
         MANDATORY_4K_QUALITY_SENTENCE,
+        MANDATORY_SHARP_NO_AI_ERROR_SENTENCE,
     ))
     available = PLANNER_PROMPT_MAX_CHARS - len(beat_block) - len(mandatory_suffix) - 2
     if available < 0:
@@ -365,6 +478,7 @@ You are Zizen Labs' professional short AI video prompt planner for fal.ai Veo 3.
 Task:
 - Read ONLY the user's text input below.
 - Rewrite it into one concise, high-quality English video generation plan.
+- Every string in "replicate_prompt" and every item in "beats" MUST be English only, regardless of the user's input language. Translate descriptive text to English while preserving proper nouns, brand names, and product names.
 - The source clip is exactly {source_duration} seconds at {resolution}, with no native audio.
 - Return EXACTLY {minimum_beats} distinct visual/action beats in the "beats" array: not fewer and not more.
 - Each beat must be one short, concrete, visible action or camera/environment change.
@@ -403,7 +517,7 @@ The beats array shown above is only structural. Your actual array must contain e
 
 
 def fallback_prompt(user_prompt: str, source_duration: int, minimum_beats: int) -> str:
-    base = user_prompt or "A professional cinematic short AI video with realistic motion and emotional visual storytelling."
+    base = translate_prompt_text_to_english(user_prompt) if user_prompt else "A professional cinematic short AI video with realistic motion and emotional visual storytelling."
     overview = (
         f"{base}. Professional cinematic {source_duration}-second source video. "
         "One coherent scene, realistic natural motion, purposeful restrained camera movement, "
@@ -459,8 +573,8 @@ def plan_replicate_prompt(
                 {
                     "role": "system",
                     "content": (
-                        "Return valid JSON only. The beats array must contain exactly the requested "
-                        "number of short visible action beats."
+                        "Return valid JSON only. Every descriptive string must be English only. "
+                        "The beats array must contain exactly the requested number of short visible action beats."
                     ),
                 },
                 {"role": "user", "content": instruction},
@@ -478,6 +592,10 @@ def plan_replicate_prompt(
         if not beats:
             actual = len(data.get("beats")) if isinstance(data.get("beats"), list) else 0
             errors.append(f"beats must contain exactly {minimum_beats} valid items; received {actual}")
+        if base_prompt and _contains_vietnamese_prompt_text(base_prompt):
+            errors.append("replicate_prompt must be English only")
+        if beats and any(_contains_vietnamese_prompt_text(beat) for beat in beats):
+            errors.append("all beats must be English only")
 
         if not errors:
             prompt = compose_prompt_with_verified_beats(base_prompt, beats)
@@ -608,8 +726,11 @@ def build_fal_input(
             f"fal.ai Veo 3.1 Lite supports only 4s, 6s, or 8s source duration; received {source_duration}s."
         )
 
+    final_prompt = ensure_mandatory_prompt_sentences(prompt)
+    assert_provider_prompt_is_english(final_prompt)
+
     input_payload = {
-        "prompt": prompt,
+        "prompt": final_prompt,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "duration": f"{int(source_duration)}s",
@@ -624,7 +745,8 @@ def build_fal_input(
         except Exception as e:
             log(f"Ignoring invalid FAL_EXTRA_INPUT_JSON: {e}")
 
-    # These fields are hard-locked after optional extras so tier/cost/audio rules cannot be overridden.
+    # These fields are hard-locked after optional extras so provider prompt/tier/cost/audio rules cannot be overridden.
+    input_payload["prompt"] = final_prompt
     input_payload["duration"] = f"{int(source_duration)}s"
     input_payload["resolution"] = resolution
     input_payload["generate_audio"] = False
@@ -1545,9 +1667,10 @@ def generate_rep_sdt2v_ai_ads_video(job: Dict[str, Any]) -> Dict[str, Any]:
         log(f"STAGE DONE | planner | elapsed={stage_timings['planner']:.2f}s")
         _raise_if_future_failed(audio_future, "fal.ai submission")
 
-        # Prompt construction is intentionally unchanged.
+        # Keep the existing prompt construction flow; apply only the requested mandatory-quality and English-only guards.
         prompt = _str(plan.get("replicate_prompt") or plan.get("seedance_prompt")) or fallback_prompt(user_prompt, source_duration, minimum_beats)
         prompt = ensure_mandatory_prompt_sentences(prompt)
+        assert_provider_prompt_is_english(prompt)
 
         fal_started = time.perf_counter()
         rep_result = call_fal_t2v(
